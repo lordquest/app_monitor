@@ -1,0 +1,123 @@
+name: release
+
+# 打 tag（v*）时构建三平台产物并挂到 Release；手动触发时只构造成 artifact，方便验证。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # winit / glow / wgpu 在 Linux 上需要 X11 + Wayland + GL 的头文件；
+      # Windows 与 macOS 用 runner 自带的工具链即可。
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxi-dev libgl1-mesa-dev libgtk-3-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Resolve version and stage name
+        id: ver
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            v="$GITHUB_REF_NAME"
+          else
+            v="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "stage=app-monitor-$v-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+          echo "版本: $v"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "dist/${{ steps.ver.outputs.stage }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/app-monitor.exe" $stage
+          Copy-Item README.md, LICENSE $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+          Get-ChildItem dist
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          stage="dist/${{ steps.ver.outputs.stage }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/app-monitor" "$stage/"
+          cp README.md LICENSE "$stage/"
+          tar -czf "$stage.tar.gz" -C dist "${{ steps.ver.outputs.stage }}"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.stage }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            跨平台软件追踪下载器 `app-monitor` ${{ github.ref_name }}。
+
+            | 平台 | 文件 |
+            | --- | --- |
+            | Windows x64 | `app-monitor-${{ github.ref_name }}-windows-x64.zip` |
+            | Linux x64 | `app-monitor-${{ github.ref_name }}-linux-x64.tar.gz` |
+            | macOS arm64 (Apple Silicon) | `app-monitor-${{ github.ref_name }}-macos-arm64.tar.gz` |
+
+            解压后直接运行 `app-monitor`（Windows 为 `app-monitor.exe`），
+            首次启动会在可执行文件旁创建 `app_monitor_data/` 存放配置与追踪清单。
+
+            - macOS 未签名，首次运行若被拦截：`xattr -d com.apple.quarantine ./app-monitor`
+            - Linux 需要 X11/Wayland 与 OpenGL 或 Vulkan 驱动；无 GPU 可在软件渲染环境用 `AM_GL=1` 回退 glow
