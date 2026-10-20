@@ -1,5 +1,9 @@
 # App Monitor · 跨平台软件追踪下载器
 
+![release](https://img.shields.io/github/v/release/lordquest/app_monitor?label=release)
+![build](https://img.shields.io/github/actions/workflow/status/lordquest/app_monitor/release.yml?label=build)
+![license](https://img.shields.io/github/license/lordquest/app_monitor)
+
 用 Rust + egui 写的桌面小工具：**给它一堆「网站 / 仓库 + 软件名」，它替你盯着最新版本**，把版本号、发布时间、更新说明和下载直链整理到一张卡片上，你决定要不要下，它负责下（断点续传 + SHA-256 校验）。
 
 ![概览](docs/screenshot-overview.png)
@@ -23,6 +27,18 @@
 
 ![下载中](docs/screenshot-download.png)
 ![添加追踪](docs/screenshot-add.png)
+
+## 下载（预编译）
+
+从 [Releases](https://github.com/lordquest/app_monitor/releases) 直接下载，解压即用：
+
+| 平台 | 文件 |
+| --- | --- |
+| Windows x64 | `app-monitor-v0.1.0-windows-x64.zip`（`app-monitor.exe`） |
+| Linux x64 | `app-monitor-v0.1.0-linux-x64.tar.gz`（需 X11/Wayland + OpenGL/Vulkan 驱动） |
+| macOS arm64（Apple Silicon） | `app-monitor-v0.1.0-macos-arm64.tar.gz`（未签名，首次运行如被拦截执行 `xattr -d com.apple.quarantine ./app-monitor`） |
+
+Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来自 GitHub Actions 同一份源码构建。版本号见 tag，本仓库目前对应 `0.1.0`。
 
 ## 特性
 
@@ -51,6 +67,20 @@ build-release.cmd
 ```
 
 产物：`target/release/app-monitor.exe`，数据在 `target/release/app_monitor_data/`。
+
+### 自动发布（GitHub Actions）
+
+`.github/workflows/release.yml` 在三个 runner 上并行 `cargo build --release`（Windows x64 / Linux x64 / macOS arm64），并把产物打包上传：
+
+```bash
+git tag -a v0.1.1 -m "app-monitor v0.1.1"   # 打 tag 即触发构建 + 发布 Release
+git push origin v0.1.1
+```
+
+- 打 `v*` tag → 构建完成后自动创建 Release 并挂上三平台附件（含 `README.md` / `LICENSE`）。
+- 在 Actions 页面手动 `Run workflow` → 只构建并保留 artifact（14 天），不发布，方便先验证。
+- 构建使用 `Swatinem/rust-cache`，Linux 侧自动安装 winit/glow/wgpu 需要的 X11 / Wayland / GL 头文件。
+- 公开仓库的 Actions 分钟数不额外计费；release 附件按仓库流量计算。
 
 首次启动会用内置的默认清单播种（就是本项目的示例清单），按 `Ctrl+N` 可以粘贴自己的清单。
 
