@@ -1,0 +1,23 @@
+# Rust build output
+/target
+
+# Local runtime data (config contains the GitHub token, history, cached tracks)
+/app_monitor_data
+**/app_monitor_data/
+
+# Downloaded installers / self-test artefacts
+/downloads
+*.part
+.selftest/
+.shots/
+.shots_run.log
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# WorkBuddy session + memory notes (local only)
+.workbuddy/
