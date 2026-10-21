@@ -111,7 +111,7 @@ where
     let mut restarted = false;
     loop {
         let mut req = http
-            .client
+            .download_client()
             .get(&spec.url)
             .header(reqwest::header::ACCEPT, "*/*")
             // Byte-exact transfer: compression would make Content-Length and Range

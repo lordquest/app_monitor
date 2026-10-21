@@ -1376,6 +1376,17 @@ impl App {
                 });
                 ui.checkbox(&mut self.settings.auto_start, "启动时自动检查全部追踪项");
                 ui.checkbox(&mut self.settings.prefer_os, "下载时优先展示当前系统对应的文件");
+                // 逃生阀是环境变量，界面上没入口；不提示的话用户容易忘了自己开过。
+                if crate::http::downgrade_allowed() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "注意：已启用 AM_ALLOW_DOWNGRADE —— 下载允许 https → http 降级，包体可能被中途替换。",
+                        )
+                        .size(10.5)
+                        .color(ORANGE),
+                    );
+                }
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(format!("数据目录：{}", data_dir_hint()))

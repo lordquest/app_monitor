@@ -28,6 +28,9 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 pub struct Http {
     pub client: Client,
+    /// 下载专用客户端，仅在 `AM_ALLOW_DOWNGRADE=1` 时存在（放宽了「拒绝 https → http」）。
+    /// 用 `Option` 而不是永远建两个，是为了默认情况下不多一份连接池与 TLS 配置。
+    relax: Option<Client>,
     /// host → (cookie name, value). Stored per name so a repeated `Set-Cookie`
     /// replaces the old value instead of piling up duplicate pairs.
     cookies: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -55,38 +58,87 @@ pub struct Fetched {
 ///
 /// 注意它**不**拦「本来就是 http 的链接」——那是站点的既有事实，直接拦掉会让
 /// 大批只提供 http 的站点整个失效；那种情况由下载列表里的「明文 http」红标提示。
-fn redirect_verdict(next: &reqwest::Url, previous: &[reqwest::Url]) -> Result<(), &'static str> {
+///
+/// `allow_downgrade` 只由 `AM_ALLOW_DOWNGRADE=1` 打开，且**只作用于下载**：
+/// 解析（`get_text` / `get_json`）永远走严格客户端，因为页面内容决定了下一个要下载
+/// 的 URL 和版本号，被换掉等于整套判断都被人接管。
+fn redirect_verdict(
+    next: &reqwest::Url,
+    previous: &[reqwest::Url],
+    allow_downgrade: bool,
+) -> Result<(), &'static str> {
     if previous.len() >= 12 {
         return Err("重定向次数过多");
     }
-    if next.scheme() == "http" && previous.iter().any(|u| u.scheme() == "https") {
+    if !allow_downgrade
+        && next.scheme() == "http"
+        && previous.iter().any(|u| u.scheme() == "https")
+    {
         return Err("拒绝 https → http 降级跳转");
     }
     Ok(())
 }
 
-impl Http {
-    pub fn new(proxy: &str, token: Option<String>) -> Result<Self, String> {        let mut b = Client::builder()
-            .user_agent(UA)
-            // Some fronted sites (Cloudflare with a slow edge) take 40s+ to
-            // first byte; the request-level timeout below is the real guard.
-            .timeout(Duration::from_secs(55))
-            .connect_timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                match redirect_verdict(attempt.url(), attempt.previous()) {
-                    Ok(()) => attempt.follow(),
-                    Err(reason) => attempt.error(reason),
-                }
-            }));
-        if !proxy.trim().is_empty() {
-            b = b.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| format!("代理地址无效: {e}"))?);
+/// `AM_ALLOW_DOWNGRADE=1`：下载允许 https → http。
+///
+/// 逃生阀存在的理由是「真实站点不守规矩」：如果某个站把 https 页面跳到 http 的 CDN，
+/// 严格模式下永远下不了。打开它等于自愿接受明文传输风险，所以启动时会打一条 warn 日志。
+pub fn downgrade_allowed() -> bool {
+    match std::env::var("AM_ALLOW_DOWNGRADE") {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        let client = b.build().map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
+        Err(_) => false,
+    }
+}
+
+fn redirect_policy(allow_downgrade: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        match redirect_verdict(attempt.url(), attempt.previous(), allow_downgrade) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    })
+}
+
+fn build_client(proxy: &str, allow_downgrade: bool) -> Result<Client, String> {
+    let mut b = Client::builder()
+        .user_agent(UA)
+        // Some fronted sites (Cloudflare with a slow edge) take 40s+ to
+        // first byte; the request-level timeout below is the real guard.
+        .timeout(Duration::from_secs(55))
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(redirect_policy(allow_downgrade));
+    if !proxy.trim().is_empty() {
+        b = b.proxy(
+            reqwest::Proxy::all(proxy.trim()).map_err(|e| format!("代理地址无效: {e}"))?,
+        );
+    }
+    b.build()
+        .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))
+}
+
+impl Http {
+    pub fn new(proxy: &str, token: Option<String>) -> Result<Self, String> {
+        let client = build_client(proxy, false)?;
+        let relax = if downgrade_allowed() {
+            log::warn!("AM_ALLOW_DOWNGRADE 已设置：下载允许 https → http 降级跳转（包体可被中途替换）");
+            Some(build_client(proxy, true)?)
+        } else {
+            None
+        };
         Ok(Self {
             client,
+            relax,
             cookies: Mutex::new(HashMap::new()),
             token,
         })
+    }
+
+    /// 下载器要用的客户端：默认与解析同一个，只有 `AM_ALLOW_DOWNGRADE=1` 才换成放宽的那个。
+    pub fn download_client(&self) -> &Client {
+        self.relax.as_ref().unwrap_or(&self.client)
     }
 
     fn cookie_for(&self, host: &str) -> Option<String> {
@@ -344,7 +396,7 @@ mod tests {
     fn downgrade_to_plain_http_is_refused() {
         let prev = urls(&["https://example.com/dl/app.exe"]);
         let next = reqwest::Url::parse("http://example.com/dl/app.exe").unwrap();
-        assert_eq!(redirect_verdict(&next, &prev), Err("拒绝 https → http 降级跳转"));
+        assert_eq!(redirect_verdict(&next, &prev, false), Err("拒绝 https → http 降级跳转"));
     }
 
     #[test]
@@ -352,22 +404,45 @@ mod tests {
         // http → https (7-zip.org 的真实行为) 必须放行。
         let prev = urls(&["http://www.7-zip.org/a/7z2604.exe"]);
         let next = reqwest::Url::parse("https://www.7-zip.org/a/7z2604.exe").unwrap();
-        assert_eq!(redirect_verdict(&next, &prev), Ok(()));
+        assert_eq!(redirect_verdict(&next, &prev, false), Ok(()));
 
         // 一直是明文的站点不该被这条规则挡死。
         let prev = urls(&["http://dl.example.com/a.zip"]);
         let next = reqwest::Url::parse("http://cdn.example.com/a.zip").unwrap();
-        assert_eq!(redirect_verdict(&next, &prev), Ok(()));
+        assert_eq!(redirect_verdict(&next, &prev, false), Ok(()));
 
         // https → https 的不同主机（GitHub 资产跳转）必须放行。
         let prev = urls(&["https://github.com/x/y/releases/download/v1/a.exe"]);
         let next = reqwest::Url::parse("https://release-assets.githubusercontent.com/a.exe").unwrap();
-        assert_eq!(redirect_verdict(&next, &prev), Ok(()));
+        assert_eq!(redirect_verdict(&next, &prev, false), Ok(()));
 
         // 首个请求本身就是 http：previous 里的初始 URL 是 http，不算降级。
         let prev = urls(&["http://example.com/a.exe"]);
         let next = reqwest::Url::parse("http://example.com/b.exe").unwrap();
-        assert_eq!(redirect_verdict(&next, &prev), Ok(()));
+        assert_eq!(redirect_verdict(&next, &prev, false), Ok(()));
+    }
+
+    /// AM_ALLOW_DOWNGRADE=1 只放宽 https → http，其它规则不动。
+    #[test]
+    fn escape_hatch_allows_downgrade_only_when_opted_in() {
+        let prev = urls(&["https://example.com/dl/app.exe"]);
+        let next = reqwest::Url::parse("http://cdn.example.com/app.exe").unwrap();
+        assert_eq!(redirect_verdict(&next, &prev, false), Err("拒绝 https → http 降级跳转"));
+        assert_eq!(redirect_verdict(&next, &prev, true), Ok(()));
+    }
+
+    /// 解析永远严格：即便开了逃生阀，页面抓取用的也是不带 relax 的那个客户端。
+    #[test]
+    fn parse_client_stays_strict_even_with_escape_hatch() {
+        let http = Http::new("", None).unwrap();
+        // relax 只在开关打开时存在，默认必须是 None —— 否则等于永久放宽。
+        if downgrade_allowed() {
+            assert!(http.relax.is_some(), "开了逃生阀却没有放宽的客户端");
+        } else {
+            assert!(http.relax.is_none());
+            // 同一个客户端：解析与下载共用严格策略。
+            assert!(std::ptr::eq(&http.client, http.download_client()));
+        }
     }
 
     #[test]
@@ -376,7 +451,9 @@ mod tests {
             .map(|i| reqwest::Url::parse(&format!("https://example.com/{i}")).unwrap())
             .collect();
         let next = reqwest::Url::parse("https://example.com/next").unwrap();
-        assert_eq!(redirect_verdict(&next, &prev), Err("重定向次数过多"));
+        assert_eq!(redirect_verdict(&next, &prev, false), Err("重定向次数过多"));
+        // 逃生阀只放宽降级这一条，链长封顶仍然生效。
+        assert_eq!(redirect_verdict(&next, &prev, true), Err("重定向次数过多"));
     }
 
     /// 端到端：真正的 301 死循环要能浮出"重定向次数过多"，而不是 reqwest 的英文原文。

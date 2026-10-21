@@ -162,6 +162,20 @@ https://www.423down.com/5228.html 7-Zip                    # 具体文章页
 - **代理**：留空则直连；也遵循 `HTTPS_PROXY` 环境变量。
 - **同时下载数 / 自动检查间隔（分钟）**。
 
+## 下载链路的安全取舍
+
+- **拒绝 https → http 降级跳转**：HTTPS 一旦跳回明文，链路上任意一跳（公共 WiFi、运营商注入、透明代理）都能把安装包换掉，而这个程序下载完是准备双击运行的。GitHub 之外的附件基本没有 SHA-256 可比，事后发现不了。链长上限 12 跳。
+- **不拦「本来就是 http」的链接**：那是站点的既有事实，硬拦会让一大批只提供 http 的国内站点整个失效。这类链接在下载列表里以红色 `· 明文 http` 标出，由你自己判断。
+- **没有摘要就直说**：非 GitHub 附件通常没有官方 SHA-256，列表里写 `· 无官方摘要，下载后无法校验`，而不是让人误以为校验过了。
+
+真实站点偶尔不守规矩（https 页面跳到 http 的 CDN），这时可以开逃生阀——**只放宽下载，解析仍严格**（页面内容决定版本号和下一个下载地址，被换掉等于整套判断被人接管）：
+
+```bash
+AM_ALLOW_DOWNGRADE=1 app-monitor    # Windows: set AM_ALLOW_DOWNGRADE=1 && app-monitor.exe
+```
+
+打开后启动日志会打一条 warn，提示包体可能被中途替换。
+
 ## 快捷键
 
 | 键 | 作用 |
@@ -203,6 +217,7 @@ Windows 上按 **DX12 → WARP → glow(OpenGL)** 顺序兜底，目标是「什
 ```bash
 AM_GL=1 app-monitor    # 强制 OpenGL/WGL（Windows: set AM_GL=1 && app-monitor.exe）
 AM_LOG=1 app-monitor   # 打开 eframe / wgpu 的调试日志，能看到实际选中的后端与适配器
+AM_ALLOW_DOWNGRADE=1 app-monitor   # 下载允许 https → http 降级（逃生阀，见上一节）
 ```
 
 > **只编 DX12 一个 wgpu 后端，绝不启用 Vulkan。** wgpu 默认会先枚举 Vulkan 适配器，而部分老驱动
