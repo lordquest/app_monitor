@@ -34,11 +34,11 @@
 
 | 平台 | 文件 |
 | --- | --- |
-| Windows x64 | `app-monitor-v0.1.0-windows-x64.zip`（`app-monitor.exe`） |
-| Linux x64 | `app-monitor-v0.1.0-linux-x64.tar.gz`（需 X11/Wayland + OpenGL/Vulkan 驱动） |
-| macOS arm64（Apple Silicon） | `app-monitor-v0.1.0-macos-arm64.tar.gz`（未签名，首次运行如被拦截执行 `xattr -d com.apple.quarantine ./app-monitor`） |
+| Windows x64 | `app-monitor-v0.1.1-windows-x64.zip`（`app-monitor.exe`） |
+| Linux x64 | `app-monitor-v0.1.1-linux-x64.tar.gz`（需 X11/Wayland + OpenGL 3.3） |
+| macOS arm64（Apple Silicon） | `app-monitor-v0.1.1-macos-arm64.tar.gz`（未签名，首次运行如被拦截执行 `xattr -d com.apple.quarantine ./app-monitor`） |
 
-Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来自 GitHub Actions 同一份源码构建。版本号见 tag，本仓库目前对应 `0.1.0`。
+Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来自 GitHub Actions 同一份源码构建。版本号见 tag，本仓库目前对应 `0.1.1`。
 
 ## 特性
 

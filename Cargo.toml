@@ -1,6 +1,6 @@
 [package]
 name = "app-monitor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "跨平台软件追踪下载器 / cross-platform software release tracker"
 authors = ["lordquest <lordquest@163.com>"]

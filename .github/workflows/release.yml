@@ -120,4 +120,5 @@ jobs:
             首次启动会在可执行文件旁创建 `app_monitor_data/` 存放配置与追踪清单。
 
             - macOS 未签名，首次运行若被拦截：`xattr -d com.apple.quarantine ./app-monitor`
-            - Linux 需要 X11/Wayland 与 OpenGL 或 Vulkan 驱动；无 GPU 可在软件渲染环境用 `AM_GL=1` 回退 glow
+            - Linux / macOS 走 glow（OpenGL 3.3），需要 X11/Wayland 与对应驱动；Windows 走 DX12 → WARP → glow 兜底
+            - 非 GitHub 附件常无官方摘要：下载列表会标 `· 无官方摘要`，明文链接标 `· 明文 http`
