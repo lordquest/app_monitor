@@ -1,0 +1,9 @@
+# 静态链接 MSVC 运行库（/MT）。
+#
+# 默认是 /MD：exe 只依赖 VCRUNTIME140.dll / api-ms-win-crt-*.dll，在没装
+# VC++ 2015-2022 运行库的机器上会直接报 0xc000007b「应用程序无法正常启动」。
+# 打开 crt-static 后 CRT 被编进 exe，双击即可运行，代价是体积多 1MB 左右。
+#
+# 只对 Windows MSVC 目标生效，Linux / macOS 的 CI 构建不受影响。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

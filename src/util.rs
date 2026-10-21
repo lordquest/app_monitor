@@ -175,6 +175,14 @@ fn best_version(text: &str) -> Option<String> {
     let mut best: Option<(i32, String)> = None;
     for c in version_re().captures_iter(text) {
         let core = c.get(1).map(|m| m.as_str()).unwrap_or("");
+        // `font-size: 1.1em` is CSS, not a version. Inline styles leak into titles
+        // when a page ships highlight markup as text, and without this guard the
+        // guesser happily reports "1.1" for a page that is about "8.53".
+        if let Some(m) = c.get(0) {
+            if followed_by_css_unit(&text[m.end()..]) {
+                continue;
+            }
+        }
         let parts: Vec<&str> = core.split('.').collect();
         // Reject dates such as 2026.10 or IP fragments such as 192.168.1.1.
         let nums: Vec<u64> = parts.iter().filter_map(|p| p.parse().ok()).collect();
@@ -215,6 +223,24 @@ fn best_version(text: &str) -> Option<String> {
         }
     }
     best.map(|(_, v)| v)
+}
+
+/// True when `rest` continues with a CSS length unit (`em`, `px`, `%` …), i.e. the
+/// number it follows is a style value rather than a version.
+fn followed_by_css_unit(rest: &str) -> bool {
+    const UNITS: [&str; 8] = ["em", "rem", "px", "pt", "vh", "vw", "ex", "%"];
+    let rest = rest.trim_start();
+    let bytes = rest.as_bytes();
+    UNITS.iter().any(|u| {
+        let unit = u.as_bytes();
+        // Compare on bytes: slicing a str at a fixed offset panics inside CJK text.
+        bytes.len() >= unit.len()
+            && bytes[..unit.len()].eq_ignore_ascii_case(unit)
+            && rest[unit.len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric())
+    })
 }
 
 /// Split a version-ish string into comparable numeric chunks.
@@ -426,6 +452,19 @@ pub fn normalize_url(u: &str) -> String {
     }
 }
 
+/// Case-insensitive substring test that stays allocation-free when `hay` has no
+/// ASCII uppercase letters — true for CJK names and for URLs, i.e. almost every
+/// call the sidebar makes while the user types a filter.
+pub fn icontains(hay: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if !hay.bytes().any(|b| b.is_ascii_uppercase()) {
+        return hay.contains(needle_lower);
+    }
+    hay.to_lowercase().contains(needle_lower)
+}
+
 pub fn host_of(url: &str) -> String {
     url.split("://")
         .nth(1)
@@ -467,6 +506,15 @@ mod tests {
     }
 
     #[test]
+    fn ignores_css_units() {
+        // Verbatim shape of a masuit.org search card: the highlight markup is stored
+        // escaped, so it comes back as real HTML in the title.
+        let dirty = "硬件检测工具——<span style='color:red;background-color:yellow;font-size: 1.1em;font-weight:700;'>HWiNFO</span> 8.53中文版";
+        assert_eq!(best_version(dirty).as_deref(), Some("8.53"));
+        assert!(best_version("font-size: 1.1em").is_none());
+    }
+
+    #[test]
     fn matching() {
         let s = score_title("7-Zip解压软件 7-Zip 26.04 Final 中文优化版", "7-Zip");
         let s2 = score_title("Cinema 4D v2027.0.0 C4D2027 中文激活版", "7-Zip");
@@ -494,5 +542,14 @@ mod tests {
             compare_versions("0.2.113", "0.2.112"),
             std::cmp::Ordering::Greater
         );
+    }
+
+    #[test]
+    fn icontains_ignores_case() {
+        assert!(icontains("HWiNFO", "hwinfo"));
+        assert!(icontains("7-Zip 26.04", "7-zip"));
+        assert!(icontains("微信电脑版", "微信"));
+        assert!(icontains("anything", ""));
+        assert!(!icontains("7-Zip", "hwinfo"));
     }
 }

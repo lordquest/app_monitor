@@ -66,6 +66,15 @@ fn strip_markup(html: &str) -> String {
     out
 }
 
+/// Does the decoded text still contain something tag-shaped?
+///
+/// Only used as a trigger for a second strip pass; deliberately strict so prose
+/// like `1 < 2` is left alone.
+fn re_tag_like() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?i)</?[a-z][a-z0-9]*\b[^<>]*>").unwrap())
+}
+
 fn re_anchor() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).unwrap())
@@ -158,7 +167,15 @@ pub fn decode_entities(s: &str) -> String {
 pub fn to_text(html: &str) -> String {
     let no_script = re_script().replace_all(html, " ");
     let no_tags = strip_markup(&no_script);
-    let decoded = decode_entities(&no_tags);
+    let mut decoded = decode_entities(&no_tags);
+    // Some sites store the keyword-highlight markup *escaped* inside titles
+    // (masuit.org: `&lt;span style='…font-size: 1.1em…'&gt;HWiNFO&lt;/span&gt;`).
+    // Stripping before decoding leaves those entities intact, and decoding then
+    // turns them back into real tags — so the title came out as HTML and the
+    // version guesser read "1.1" out of the inline CSS. One more pass fixes it.
+    if re_tag_like().is_match(&decoded) {
+        decoded = strip_markup(&decoded);
+    }
     collapse(&decoded)
 }
 
@@ -378,6 +395,24 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].href, "/go.php?url=abc");
         assert_eq!(a[0].text, "本地下载");
+    }
+
+    #[test]
+    fn escaped_markup_is_stripped_like_raw_markup() {
+        // masuit.org stores the keyword highlight escaped inside card titles; both
+        // forms must reduce to the same text (before this, the escaped one came out
+        // as literal HTML and the version guesser read "1.1" from the inline CSS).
+        let raw = "<a href='/x'>硬件检测工具——<span style='font-size: 1.1em;'>HWiNFO</span> 8.53中文版</a>";
+        let escaped = "<a href='/x'>硬件检测工具——&lt;span style='font-size: 1.1em;'&gt;HWiNFO&lt;/span&gt; 8.53中文版</a>";
+        assert_eq!(to_text(raw), to_text(escaped));
+        assert!(!to_text(escaped).contains("1.1em"));
+        assert!(to_text(escaped).contains("8.53中文版"));
+    }
+
+    #[test]
+    fn plain_less_than_is_kept() {
+        // Escaped comparison operators must not trigger the extra strip pass.
+        assert_eq!(to_text("<p>要求 1 &lt; 2 且 a &gt; b</p>"), "要求 1 < 2 且 a > b");
     }
 
     #[test]

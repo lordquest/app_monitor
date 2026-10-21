@@ -511,7 +511,10 @@ fn extract_article(
         return Err("页面内容为空或过短".into());
     }
     let title = listing_title
-        .filter(|t| !t.trim().is_empty())
+        // A listing title that still carries markup is worse than no title at all:
+        // `guess_version` reads numbers out of it (`font-size: 1.1em` → "1.1"), so
+        // fall through to the article page's own title instead.
+        .filter(|t| !t.trim().is_empty() && !t.contains('<'))
         .or_else(|| html::page_title(body))
         .unwrap_or_else(|| query.to_string());
     let title = if title.trim().is_empty() { query.to_string() } else { title };

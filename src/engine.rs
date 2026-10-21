@@ -7,10 +7,19 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
 
 use crate::download::{self, DlSpec, Progress};
 use crate::http::Http;
 use crate::model::{Release, Track};
+
+/// How many items may be resolved at the same time.
+///
+/// A refresh used to spawn one task per tracked item with no ceiling; with a few
+/// dozen items that is hundreds of concurrent requests against the same two or
+/// three sites, which trips their bot protection (403 / Cloudflare) and makes the
+/// whole batch slower than resolving them a few at a time.
+const RESOLVE_CONCURRENCY: usize = 6;
 
 pub enum UiMsg {
     Resolved(String, Box<Release>),
@@ -47,6 +56,7 @@ pub struct Engine {
     pub tx: Sender<UiMsg>,
     pub rx: Receiver<UiMsg>,
     rt: Arc<Runtime>,
+    resolve_sem: Arc<Semaphore>,
 }
 
 impl Engine {
@@ -57,12 +67,19 @@ impl Engine {
             tx,
             rx,
             rt: Arc::new(rt),
+            resolve_sem: Arc::new(Semaphore::new(RESOLVE_CONCURRENCY)),
         }
     }
 
     pub fn start_resolve(&self, http: Arc<Http>, track: Track) {
         let tx = self.tx.clone();
+        let sem = self.resolve_sem.clone();
         self.rt.spawn(async move {
+            // Queue behind the semaphore instead of opening another connection:
+            // the permit is released when this future ends.
+            let Ok(_permit) = sem.acquire().await else {
+                return;
+            };
             match crate::provider::resolve(&http, &track).await {
                 Ok(r) => {
                     let _ = tx.send(UiMsg::Resolved(track.id.clone(), Box::new(r)));

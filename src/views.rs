@@ -7,9 +7,9 @@ use std::time::Duration;
 use egui::{Align, Align2, Color32, FontId, Layout, Margin, RichText, Rounding, ScrollArea, Stroke, Vec2};
 
 use crate::app::{
-    badge, card, ellipsis, primary_button, subtle_button, App, SettingsDraft, Tab, TaskStatus,
-    ACCENT, ACCENT_SOFT, BG, BORDER, CARD, FAINT, GREEN, GREEN_SOFT, MUTED, ORANGE, ORANGE_SOFT,
-    RED, RED_SOFT, SIDEBAR, TEXT,
+    badge, card, ellipsis, primary_button, safe_open, subtle_button, App, SettingsDraft, Tab,
+    TaskStatus, ACCENT, ACCENT_SOFT, BG, BORDER, CARD, FAINT, GREEN, GREEN_SOFT, MUTED, ORANGE,
+    ORANGE_SOFT, RED, RED_SOFT, SIDEBAR, TEXT,
 };
 use crate::model::{Asset, AssetKind, Release, SourceKind, Track};
 use crate::parse;
@@ -36,6 +36,41 @@ enum Act {
     Retry(String),
     Open(String),
     OpenDir(PathBuf),
+}
+
+/// Everything the detail header needs from a `Track`, without the release.
+///
+/// The detail page used to render from a full `Track` clone; that copy dragged the
+/// changelog and every candidate along with it once per frame. Only these few short
+/// strings are actually read, so they get copied instead.
+struct Head {
+    id: String,
+    name: String,
+    group: String,
+    url: String,
+    host: String,
+    kind: SourceKind,
+    seen_version: Option<String>,
+    last_checked: Option<i64>,
+    last_error: Option<String>,
+    has_update: bool,
+}
+
+impl Head {
+    fn from(t: &Track) -> Self {
+        Self {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            group: t.group.clone(),
+            url: t.url.clone(),
+            host: t.host(),
+            kind: t.kind,
+            seen_version: t.seen_version.clone(),
+            last_checked: t.last_checked,
+            last_error: t.last_error.clone(),
+            has_update: t.has_update(),
+        }
+    }
 }
 
 impl App {
@@ -141,9 +176,9 @@ impl App {
                 let mut groups: Vec<(String, Vec<Row>)> = Vec::new();
                 for t in &self.tracks {
                     if !filter.is_empty()
-                        && !t.name.to_lowercase().contains(&filter)
-                        && !t.url.to_lowercase().contains(&filter)
-                        && !t.group.to_lowercase().contains(&filter)
+                        && !util::icontains(&t.name, &filter)
+                        && !util::icontains(&t.url, &filter)
+                        && !util::icontains(&t.group, &filter)
                     {
                         continue;
                     }
@@ -263,7 +298,7 @@ impl App {
                                                 .as_ref()
                                                 .map(|r| r.page_url.clone())
                                                 .unwrap_or_else(|| t.url.clone());
-                                            let _ = open::that_detached(url);
+                                            safe_open(&url);
                                         }
                                         ui.close_menu();
                                     }
@@ -542,18 +577,27 @@ impl App {
                     .inner_margin(Margin::symmetric(18.0, 14.0)),
             )
             .show(ctx, |ui| {
-                let track = self
-                    .selected
-                    .as_ref()
-                    .and_then(|id| self.track(id))
-                    .cloned();
-                match track {
-                    None => self.empty_state(ui),
-                    Some(t) => {
-                        ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.detail(ui, &t));
-                    }
+                let Some(id) = self.selected.clone() else {
+                    self.empty_state(ui);
+                    return;
+                };
+                let Some(idx) = self.tracks.iter().position(|t| t.id == id) else {
+                    self.empty_state(ui);
+                    return;
+                };
+                // Take the release out of the track instead of cloning the whole
+                // structure (changelog + candidates + assets) on every frame; it is
+                // handed back below. `Head` carries only the few short strings the
+                // header needs, so rendering never borrows `self.tracks`.
+                let (head, release) = {
+                    let t = &mut self.tracks[idx];
+                    (Head::from(&*t), t.release.take())
+                };
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.detail(ui, &head, release.as_ref()));
+                if let Some(i) = self.tracks.iter().position(|t| t.id == head.id) {
+                    self.tracks[i].release = release;
                 }
             });
     }
@@ -580,32 +624,32 @@ impl App {
         });
     }
 
-    fn detail(&mut self, ui: &mut egui::Ui, track: &Track) {
+    fn detail(&mut self, ui: &mut egui::Ui, head: &Head, base: Option<&Release>) {
         // ---- header ----
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new(&track.name)
+                    RichText::new(&head.name)
                         .size(22.0)
                         .strong()
                         .color(TEXT),
                 );
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
-                    badge(ui, &track.group, ACCENT, ACCENT_SOFT);
+                    badge(ui, &head.group, ACCENT, ACCENT_SOFT);
                     badge(
                         ui,
-                        track.kind.label(),
+                        head.kind.label(),
                         MUTED,
                         Color32::from_rgb(0xF2, 0xF4, 0xF8),
                     );
                     badge(
                         ui,
-                        &track.host(),
+                        &head.host,
                         MUTED,
                         Color32::from_rgb(0xF2, 0xF4, 0xF8),
                     );
-                    if let Some(r) = &track.release {
+                    if let Some(r) = base {
                         ui.label(
                             RichText::new(format!("来源: {}", r.provider))
                                 .size(10.5)
@@ -615,20 +659,18 @@ impl App {
                 });
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let page = track
-                    .release
-                    .as_ref()
+                let page = base
                     .map(|r| r.page_url.clone())
-                    .unwrap_or_else(|| track.url.clone());
+                    .unwrap_or_else(|| head.url.clone());
                 if ui.add(subtle_button("打开来源页面")).clicked() {
-                    let _ = open::that_detached(&page);
+                    safe_open(&page);
                 }
-                let busy = self.resolving.contains(&track.id);
+                let busy = self.resolving.contains(&head.id);
                 if ui
                     .add_enabled(!busy, subtle_button("刷新"))
                     .clicked()
                 {
-                    self.resolve(&track.id);
+                    self.resolve(&head.id);
                 }
                 if busy {
                     ui.spinner();
@@ -672,8 +714,8 @@ impl App {
         });
         ui.add_space(6.0);
 
-        if let Some(err) = &track.last_error {
-            let msg = if track.release.is_some() {
+        if let Some(err) = &head.last_error {
+            let msg = if base.is_some() {
                 format!("上次刷新失败：{err}（下方显示的是缓存数据）")
             } else {
                 format!("解析失败：{err}")
@@ -683,7 +725,7 @@ impl App {
                     ui.label(RichText::new(msg).size(12.0).color(RED));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("重试").clicked() {
-                            self.resolve(&track.id);
+                            self.resolve(&head.id);
                         }
                     });
                 });
@@ -691,12 +733,12 @@ impl App {
             ui.add_space(8.0);
         }
 
-        let Some(base) = track.release.clone() else {
-            if track.last_error.is_some() {
+        let Some(base) = base else {
+            if head.last_error.is_some() {
                 return;
             }
             card(ui, |ui| {
-                if self.resolving.contains(&track.id) {
+                if self.resolving.contains(&head.id) {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(RichText::new("正在解析版本与下载链接…").size(13.0).color(MUTED));
@@ -716,22 +758,33 @@ impl App {
 
         // A repo can offer several release lines (stable 1.3 / preview 2.0 / older
         // 1.2). `sel` is the tab the user picked; everything below renders that view.
-        let sel = self.candidate_index(&track.id, &base);
-        let release = base.view_of(sel);
+        let sel = self.candidate_index(&head.id, base);
+        // Software sites have no candidate strip, so the base release *is* the view
+        // and nothing needs building. Otherwise the view is moved out of the cache.
+        let view = if sel != 0 || !base.candidates.is_empty() {
+            Some(self.take_view(&head.id, sel, base))
+        } else {
+            None
+        };
+        let r: &Release = view.as_ref().unwrap_or(base);
 
-        self.version_card(ui, track, &release, sel);
+        self.version_card(ui, head, r, sel);
         ui.add_space(8.0);
 
         match self.tab {
-            Tab::Overview => self.overview(ui, track, &release),
-            Tab::Notes => self.notes_view(ui, &release),
-            Tab::History => self.history_view(ui, &release),
+            Tab::Overview => self.overview(ui, head, r),
+            Tab::Notes => self.notes_view(ui, r),
+            Tab::History => self.history_view(ui, r),
+        }
+
+        if let Some(v) = view {
+            self.put_view(&head.id, sel, base.fetched_at, v);
         }
 
         ui.add_space(14.0);
     }
 
-    fn version_card(&mut self, ui: &mut egui::Ui, track: &Track, r: &Release, sel: usize) {
+    fn version_card(&mut self, ui: &mut egui::Ui, head: &Head, r: &Release, sel: usize) {
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -758,7 +811,7 @@ impl App {
                         ui.label(
                             RichText::new(format!(
                                 "· 上次检查 {}",
-                                util::fmt_secs_ago(track.last_checked.unwrap_or(0))
+                                util::fmt_secs_ago(head.last_checked.unwrap_or(0))
                             ))
                             .size(11.0)
                             .color(FAINT),
@@ -773,9 +826,9 @@ impl App {
                         } else {
                             badge(ui, "备选版本", MUTED, Color32::from_rgb(0xF2, 0xF4, 0xF8));
                         }
-                    } else if track.has_update() {
+                    } else if head.has_update {
                         badge(ui, "发现新版本", ORANGE, ORANGE_SOFT);
-                    } else if track.seen_version.is_some() {
+                    } else if head.seen_version.is_some() {
                         badge(ui, "已是最新", GREEN, GREEN_SOFT);
                     } else {
                         badge(ui, "首次获取", ACCENT, ACCENT_SOFT);
@@ -783,7 +836,7 @@ impl App {
                 });
             });
 
-            if sel == 0 && track.has_update() {
+            if sel == 0 && head.has_update {
                 ui.add_space(8.0);
                 egui::Frame::none()
                     .fill(ORANGE_SOFT)
@@ -794,17 +847,17 @@ impl App {
                             ui.label(
                                 RichText::new(format!(
                                     "版本从 {} 变为 {}，建议先看更新说明再决定是否下载。",
-                                    track.seen_version.clone().unwrap_or_default(),
+                                    head.seen_version.clone().unwrap_or_default(),
                                     r.version
                                 ))
                                 .size(12.0)
                                 .color(ORANGE),
                             );
                             if ui.small_button("标记已知").clicked() {
-                                if let Some(t) = self.track_mut(&track.id) {
+                                if let Some(t) = self.track_mut(&head.id) {
                                     t.seen_version = Some(r.version.clone());
                                 }
-                                self.save_tracks();
+                                self.request_save_tracks();
                             }
                         });
                     });
@@ -879,13 +932,13 @@ impl App {
                     });
                 });
                 if let Some(i) = pick {
-                    self.candidate_sel.insert(track.id.clone(), i);
+                    self.candidate_sel.insert(head.id.clone(), i);
                 }
             }
         });
     }
 
-    fn overview(&mut self, ui: &mut egui::Ui, track: &Track, r: &Release) {
+    fn overview(&mut self, ui: &mut egui::Ui, head: &Head, r: &Release) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("下载文件").size(13.0).strong().color(TEXT));
@@ -899,7 +952,7 @@ impl App {
                 ui.label(
                     RichText::new(format!(
                         "保存到 {}/{}",
-                        ellipsis(track.name.as_str(), 16),
+                        ellipsis(&head.name, 16),
                         ellipsis(&r.version, 14)
                     ))
                     .size(10.5)
@@ -981,6 +1034,21 @@ impl App {
                                             .size(10.0)
                                             .color(FAINT),
                                     );
+                                } else if is_direct {
+                                    // No published digest ⇒ the bytes cannot be
+                                    // verified; say so instead of implying safety.
+                                    ui.label(
+                                        RichText::new("· 无官方摘要，下载后无法校验")
+                                            .size(10.0)
+                                            .color(ORANGE),
+                                    );
+                                }
+                                if is_direct && a.url.starts_with("http://") {
+                                    // Plain http: the transfer itself can be tampered
+                                    // with, and these links often have no digest either.
+                                    ui.label(
+                                        RichText::new("· 明文 http").size(10.0).color(RED),
+                                    );
                                 }
                                 if is_direct && a.size.is_none() {
                                     ui.label(
@@ -995,7 +1063,7 @@ impl App {
                             if is_direct {
                                 if ui.add(primary_button("下载")).clicked() {
                                     download =
-                                        Some((track.id.clone(), r.version.clone(), a.clone()));
+                                        Some((head.id.clone(), r.version.clone(), a.clone()));
                                 }
                             } else if ui.add(primary_button("打开链接")).clicked() {
                                 open_url = Some(a.url.clone());
@@ -1010,10 +1078,10 @@ impl App {
         }
 
         if let Some((tid, ver, asset)) = download {
-            self.start_asset(&tid, &ver, &asset);
+            self.start_asset(&tid, &ver, &asset, &r.page_url);
         }
         if let Some(url) = open_url {
-            let _ = open::that_detached(url);
+            safe_open(&url);
         }
         if let Some(url) = copied {
             ui.output_mut(|o| o.copied_text = url);
@@ -1034,7 +1102,7 @@ impl App {
                 ui.label(RichText::new("更新说明").size(13.0).strong().color(TEXT));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("打开原文").clicked() {
-                        let _ = open::that_detached(&r.page_url);
+                        safe_open(&r.page_url);
                     }
                 });
             });
@@ -1096,7 +1164,7 @@ impl App {
                             .color(MUTED),
                         );
                         if !v.url.is_empty() && ui.small_button("打开该版本页面").clicked() {
-                            let _ = open::that_detached(&v.url);
+                            safe_open(&v.url);
                         }
                     });
             }
@@ -1275,6 +1343,13 @@ impl App {
                     RichText::new("默认走 releases 页面与 atom 订阅，不消耗 API 额度；Token 只在回退到 API 时使用。")
                         .size(10.5)
                         .color(FAINT),
+                );
+                // The portable data folder is easy to copy or sync — say where the
+                // secret ends up rather than implying the password mask protects it.
+                ui.label(
+                    RichText::new("注意：Token 以明文保存在数据目录的 config.json（Unix 下权限 0600），请勿随目录一起分享。")
+                        .size(10.5)
+                        .color(ORANGE),
                 );
                 ui.add_space(10.0);
 

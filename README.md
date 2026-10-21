@@ -56,7 +56,7 @@ Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来�
 ## 快速开始
 
 ```bash
-cargo run            # 开发运行（默认 wgpu 渲染）
+cargo run            # 开发运行（Windows 默认 DX12，其余平台 OpenGL）
 cargo run --release  # 发布运行
 ```
 
@@ -67,6 +67,10 @@ build-release.cmd
 ```
 
 产物：`target/release/app-monitor.exe`，数据在 `target/release/app_monitor_data/`。
+
+Windows 版通过 `.cargo/config.toml` 里的 `-C target-feature=+crt-static` 静态链接 MSVC 运行库（`/MT`），
+二进制不依赖 `VCRUNTIME140.dll` / `api-ms-win-crt-*.dll`，在没装 VC++ 运行库的机器上也能直接双击运行，
+代价是体积增加约 200KB。Linux / macOS 构建不受该配置影响。
 
 ### 自动发布（GitHub Actions）
 
@@ -79,7 +83,7 @@ git push origin v0.1.1
 
 - 打 `v*` tag → 构建完成后自动创建 Release 并挂上三平台附件（含 `README.md` / `LICENSE`）。
 - 在 Actions 页面手动 `Run workflow` → 只构建并保留 artifact（14 天），不发布，方便先验证。
-- 构建使用 `Swatinem/rust-cache`，Linux 侧自动安装 winit/glow/wgpu 需要的 X11 / Wayland / GL 头文件。
+- 构建使用 `Swatinem/rust-cache`，Linux 侧自动安装 winit/glow 需要的 X11 / Wayland / GL 头文件。
 - 公开仓库的 Actions 分钟数不额外计费；release 附件按仓库流量计算。
 
 首次启动会用内置的默认清单播种（就是本项目的示例清单），按 `Ctrl+N` 可以粘贴自己的清单。
@@ -185,12 +189,28 @@ app-monitor --select nyaterm --cand 1     # 再指定打开第 2 个版本候选
 
 ## 渲染后端
 
-默认走 **wgpu**（Windows → DX12，macOS → Metal，Linux → Vulkan），因为部分显卡驱动下 WGL 表面无法呈现（表现为窗口纯白、进程不卡死）。需要 glow 时：
+Windows 上按 **DX12 → WARP → glow(OpenGL)** 顺序兜底，目标是「什么机器都能起来」：
+
+| 顺序 | 后端 | 覆盖的场景 |
+|---|---|---|
+| 1 | **DX12 硬件适配器** | 新老独显/集显（D3D12 FL11_0 自 Kepler / HD 5000 一代起就有） |
+| 2 | **DX12 WARP** | 没有可用显卡：未装驱动的虚拟机、纯 RDP 会话、Basic Display Adapter。WARP 是 Windows 自带的软件光栅化，不需要任何 GPU |
+| 3 | **glow（OpenGL 3.3）** | Win7/8 这类没有 DX12 的老系统，或 DX12 初始化失败 |
+| 4 | 弹窗 | 以上全失败时提示更新显卡驱动，而不是白屏/静默退出 |
+
+非 Windows 平台直接用 glow。`AM_GL=1` 可强制走 OpenGL（排障用）。
 
 ```bash
-AM_GL=1 app-monitor        # Windows: set AM_GL=1 && app-monitor.exe
-AM_LOG=1 app-monitor       # 打开 eframe/wgpu 的调试日志（排障用）
+AM_GL=1 app-monitor    # 强制 OpenGL/WGL（Windows: set AM_GL=1 && app-monitor.exe）
+AM_LOG=1 app-monitor   # 打开 eframe / wgpu 的调试日志，能看到实际选中的后端与适配器
 ```
+
+> **只编 DX12 一个 wgpu 后端，绝不启用 Vulkan。** wgpu 默认会先枚举 Vulkan 适配器，而部分老驱动
+> （实测 NVIDIA 425.31 / Kepler 移动显卡）在 Vulkan 首帧 present 时会在驱动内部访问违例崩溃，
+> `panic = "abort"` 下连报错都没有，用户看到的现象就是「双击毫无反应」。`Cargo.toml` 里
+> `wgpu` 显式只开 `dx12` 特性就是为了封死这条路。
+>
+> 代价是二进制大 2.95MB（glow 单后端 5.99MB → 双后端 8.9MB）——换来的是虚拟机 / 远程桌面 / 老系统也能跑。
 
 ## 已知限制
 

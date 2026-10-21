@@ -51,17 +51,83 @@ fn main() -> eframe::Result<()> {
         app::set_start_hint(name, cand);
     }
 
+    let choice = RendererChoice::from_env();
+    if let Err(err) = launch(choice) {
+        // DX12 起不来（Win7/8、驱动异常、适配器不可用）就退 OpenGL；
+        // 两条路都失败才弹窗，避免"双击毫无反应"。
+        if matches!(choice.renderer, eframe::Renderer::Wgpu) {
+            log::warn!("DX12 后端启动失败: {err}，改用 glow(OpenGL) 重试");
+            if launch(RendererChoice::glow()).is_ok() {
+                return Ok(());
+            }
+        }
+        report_fatal(&format!("{err}"));
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// 渲染后端：Windows 优先 DX12，失败退回 glow。
+///
+/// 兼容性覆盖顺序：
+/// 1. **DX12 硬件适配器** —— D3D12 FL11_0 自 Kepler / HD 5000 一代起就有，新老独显/集显都能跑；
+/// 2. **DX12 WARP** —— 没有可用显卡时（未装驱动的虚拟机、纯 RDP 会话、Basic Display Adapter），
+///    Windows 自带的软件光栅化顶上。egui-wgpu 请求适配器时 `force_fallback_adapter: false`，
+///    所以有硬件就优先硬件，没有才落到 WARP，正是我们要的行为；
+/// 3. **glow(OpenGL 3.3)** —— Win7/8 这类没有 DX12 的老系统，或 DX12 初始化失败；
+/// 4. 都失败 → 弹窗提示更新显卡驱动。
+///
+/// 关键点：wgpu 只编入 `dx12` 后端，**绝不枚举 Vulkan** —— 老 NVIDIA 驱动（实测 425.31 /
+/// Kepler 移动显卡）在 Vulkan 首帧 present 时会崩在驱动内部（`nvoglv64.dll`），
+/// `panic = "abort"` + `windows_subsystem = "windows"` 意味着接不住也打不出日志。
+///
+/// 非 Windows 平台直接用 glow，不启用 metal/vulkan 特性，避免半配置的 wgpu 后端。
+/// `AM_GL=1` 可强制走 OpenGL（排障用）。
+#[derive(Clone, Copy, Debug)]
+struct RendererChoice {
+    renderer: eframe::Renderer,
+    backends: wgpu::Backends,
+}
+
+impl RendererChoice {
+    fn glow() -> Self {
+        Self {
+            renderer: eframe::Renderer::Glow,
+            backends: wgpu::Backends::empty(),
+        }
+    }
+
+    fn dx12() -> Self {
+        Self {
+            renderer: eframe::Renderer::Wgpu,
+            backends: wgpu::Backends::DX12,
+        }
+    }
+
+    fn from_env() -> Self {
+        if std::env::var("AM_GL").is_ok() {
+            log::info!("AM_GL 已设置，强制使用 glow(OpenGL)");
+            return Self::glow();
+        }
+        if cfg!(target_os = "windows") {
+            Self::dx12()
+        } else {
+            Self::glow()
+        }
+    }
+}
+
+fn launch(choice: RendererChoice) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([980.0, 640.0])
             .with_title("App Monitor · 软件追踪下载器"),
-        // wgpu → DX12 on Windows. Some drivers fail to present a WGL surface
-        // (blank white window), so glow is only used when explicitly asked for.
-        renderer: if std::env::var("AM_GL").is_ok() {
-            eframe::Renderer::Glow
-        } else {
-            eframe::Renderer::Wgpu
+        renderer: choice.renderer,
+        // 限定后端：只允许 DX12，避免 wgpu 自己挑到会崩的组合。
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            supported_backends: choice.backends,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -75,6 +141,20 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new()))
         }),
     )
+}
+
+/// GUI 子系统没有控制台，出错必须弹窗，否则就是"双击没反应"。
+fn report_fatal(msg: &str) {
+    eprintln!("app-monitor 启动失败: {msg}");
+    let _ = rfd::MessageDialog::new()
+        .set_title("App Monitor 启动失败")
+        .set_description(format!(
+            "{msg}\n\n界面需要 DirectX 12（含 WARP 软件渲染）或 OpenGL 3.3 或更高版本。\
+             若本机没有可用的显卡驱动（例如未安装驱动的虚拟机、或纯远程桌面会话），\
+             请更新显卡驱动后重试。"
+        ))
+        .set_level(rfd::MessageLevel::Error)
+        .show();
 }
 
 /// `--fetch <url> [--save out.html]`: fetch a page through the app's own HTTP

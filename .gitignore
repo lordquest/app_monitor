@@ -7,6 +7,7 @@
 
 # Downloaded installers / self-test artefacts
 /downloads
+/dist/
 *.part
 .selftest/
 .shots/

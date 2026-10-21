@@ -15,9 +15,22 @@ use reqwest::{Client, StatusCode};
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+/// Pages larger than this are almost certainly not a download article; refusing
+/// them keeps a hostile or broken response from ballooning memory (the parser then
+/// makes several more full-size copies of the body).
+const MAX_TEXT_BODY: usize = 4 * 1024 * 1024;
+/// Diagnostic-only reads (error pages, JSON) need far less.
+const MAX_AUX_BODY: usize = 64 * 1024;
+const MAX_JSON_BODY: usize = 2 * 1024 * 1024;
+/// Back-off ceiling for 429 responses, so a hostile `Retry-After: 86400` cannot
+/// stall the resolve queue for a day.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
+
 pub struct Http {
     pub client: Client,
-    cookies: Mutex<HashMap<String, String>>,
+    /// host → (cookie name, value). Stored per name so a repeated `Set-Cookie`
+    /// replaces the old value instead of piling up duplicate pairs.
+    cookies: Mutex<HashMap<String, Vec<(String, String)>>>,
     pub token: Option<String>,
 }
 
@@ -36,7 +49,19 @@ impl Http {
             // first byte; the request-level timeout below is the real guard.
             .timeout(Duration::from_secs(55))
             .connect_timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::limited(12));
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 12 {
+                    return attempt.error("重定向次数过多");
+                }
+                // Refuse https → http: anyone on the path could then swap the
+                // bytes, and non-GitHub downloads carry no digest to catch it.
+                if attempt.url().scheme() == "http"
+                    && attempt.previous().iter().any(|u| u.scheme() == "https")
+                {
+                    return attempt.error("拒绝 https → http 降级跳转");
+                }
+                attempt.follow()
+            }));
         if !proxy.trim().is_empty() {
             b = b.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| format!("代理地址无效: {e}"))?);
         }
@@ -49,7 +74,18 @@ impl Http {
     }
 
     fn cookie_for(&self, host: &str) -> Option<String> {
-        self.cookies.lock().ok()?.get(host).cloned()
+        let jar = self.cookies.lock().ok()?;
+        let pairs = jar.get(host)?;
+        if pairs.is_empty() {
+            return None;
+        }
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 
     /// Cookies gathered for the host of `url` — download requests reuse them so
@@ -58,23 +94,35 @@ impl Http {
         self.cookie_for(&crate::util::host_of(url))
     }
 
-    fn store_cookies(&self, host: &str, resp: &reqwest::Response) {
+    /// Store the cookies handed out by `resp` under the host that actually served
+    /// it (`resp.url()`), not under the host we asked for: after a cross-host
+    /// redirect the two differ, and keying by the request host sent one site's
+    /// cookies to another.
+    fn store_cookies(&self, resp: &reqwest::Response) {
+        let host = crate::util::host_of(resp.url().as_str());
+        if host.is_empty() {
+            return;
+        }
         let mut jar = match self.cookies.lock() {
             Ok(j) => j,
             Err(_) => return,
         };
-        let entry = jar.entry(host.to_string()).or_default();
+        let entry = jar.entry(host).or_default();
         for hv in resp.headers().get_all(reqwest::header::SET_COOKIE) {
-            if let Ok(s) = hv.to_str() {
-                if let Some(pair) = s.split(';').next() {
-                    let pair = pair.trim();
-                    if pair.contains('=') {
-                        if !entry.is_empty() {
-                            entry.push_str("; ");
-                        }
-                        entry.push_str(pair);
-                    }
-                }
+            let Ok(s) = hv.to_str() else { continue };
+            let Some(pair) = s.split(';').next() else {
+                continue;
+            };
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let (name, value) = (name.trim(), value.trim());
+            if name.is_empty() {
+                continue;
+            }
+            match entry.iter_mut().find(|(k, _)| k == name) {
+                Some(slot) => slot.1 = value.to_string(),
+                None => entry.push((name.to_string(), value.to_string())),
             }
         }
     }
@@ -94,8 +142,7 @@ impl Http {
                 .client
                 .get(url)
                 .header(ACCEPT, accept.unwrap_or("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"))
-                .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-                .header("Accept-Encoding", "identity");
+                .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
             if let Some(c) = self.cookie_for(&host) {
                 req = req.header(COOKIE, c);
             }
@@ -120,9 +167,15 @@ impl Http {
                 }
             };
             let status = resp.status();
-            self.store_cookies(&host, &resp);
-            if status == StatusCode::FORBIDDEN && attempt == 1 {
+            self.store_cookies(&resp);
+            if status == StatusCode::FORBIDDEN && attempt <= 1 {
                 tokio::time::sleep(Duration::from_millis(350)).await;
+                continue;
+            }
+            // 429 used to surface straight to the user; honour Retry-After once.
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt <= 2 {
+                let wait = retry_after(&resp).unwrap_or(Duration::from_secs(2));
+                tokio::time::sleep(wait).await;
                 continue;
             }
             let final_url = resp.url().to_string();
@@ -132,7 +185,7 @@ impl Http {
                     .get("cf-mitigated")
                     .map(|v| v.to_str().unwrap_or("").contains("challenge"))
                     .unwrap_or(false);
-                let body = resp.text().await.unwrap_or_default();
+                let body = read_body(resp, MAX_AUX_BODY).await.unwrap_or_default();
                 let challenge = cf_hint
                     || body.contains("Just a moment")
                     || body.contains("challenge-platform")
@@ -147,7 +200,7 @@ impl Http {
                     s => format!("HTTP {s}"),
                 });
             }
-            let body = resp.text().await.map_err(|e| describe_reqwest(e))?;
+            let body = read_body(resp, MAX_TEXT_BODY).await?;
             return Ok(Fetched {
                 final_url,
                 status: status.as_u16(),
@@ -157,6 +210,11 @@ impl Http {
     }
 
     pub async fn get_json(&self, url: &str) -> Result<String, String> {
+        // The bearer token is attached unconditionally below; make sure the URL can
+        // only ever be the GitHub API so a future caller cannot leak it to a mirror.
+        if crate::util::host_of(url) != "api.github.com" {
+            return Err("内部错误：拒绝向非 GitHub API 主机发送凭证".into());
+        }
         let mut req = self
             .client
             .get(url)
@@ -174,7 +232,7 @@ impl Http {
                 s => format!("GitHub API HTTP {s}"),
             });
         }
-        resp.text().await.map_err(describe_reqwest)
+        read_body(resp, MAX_JSON_BODY).await
     }
 
     /// Query the size of a remote file without downloading it (best effort).
@@ -184,6 +242,46 @@ impl Http {
         let resp = req.send().await.ok()?;
         resp.content_length()
     }
+}
+
+/// Read a body with a hard cap.
+///
+/// `Response::text()` buffers whatever the server sends; a huge or hostile page
+/// would then be copied several more times by the parser (lowercasing, entity
+/// decoding, char collection), so the cap belongs here rather than at the parser.
+async fn read_body(mut resp: reqwest::Response, max: usize) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > max {
+                    return Err(format!(
+                        "响应超过 {}，已中止读取",
+                        crate::util::fmt_bytes(max as u64)
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(describe_reqwest(e)),
+        }
+    }
+    // Same behaviour as `Response::text()` without the `charset` feature: UTF-8
+    // with replacement characters.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// `Retry-After` in seconds, clamped so a server cannot park the resolve queue.
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let secs = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_WAIT))
 }
 
 pub fn describe_reqwest(e: reqwest::Error) -> String {

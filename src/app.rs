@@ -178,11 +178,21 @@ pub struct App {
     /// Track id → index into `Release::candidates` currently shown in the detail
     /// page. 0 is the primary (stable) pick.
     pub(crate) candidate_sel: HashMap<String, usize>,
+    /// Cached `Release::view_of(sel)` result. `view_of` copies the changelog and the
+    /// whole asset list, so building it per frame was the single most expensive
+    /// thing this UI did; the cache is keyed by (track, tab, fetched_at) and the
+    /// value is *moved* out while rendering, then moved back.
+    pub(crate) view_cache: Option<(String, usize, i64, Release)>,
+    /// Set when a handler inside the detail page changes tracks state; the write is
+    /// deferred to the end of the frame because the detail page has the release
+    /// moved out of the track while it renders (serialising then would drop it).
+    pub(crate) pending_save_tracks: bool,
 }
 
 impl App {
     pub fn new() -> Self {
         let store = Store::load();
+        let seeded = store.seeded;
         let http = make_http(&store.config);
         let mut app = Self {
             engine: Engine::new(),
@@ -209,6 +219,8 @@ impl App {
             ctx: None,
             remove_target: None,
             candidate_sel: HashMap::new(),
+            view_cache: None,
+            pending_save_tracks: false,
         };
         app.selected = app.tracks.first().map(|t| t.id.clone());
         if let Some((Some(name), cand)) = START_HINT.get() {
@@ -222,7 +234,11 @@ impl App {
                 app.candidate_sel.insert(t.id.clone(), *cand);
             }
         }
-        app.save_tracks();
+        // Only materialise tracks.json when the list came from the shipped defaults;
+        // an unconditional write here meant one full ~300KB serialisation per launch.
+        if seeded {
+            app.save_tracks();
+        }
         if app.cfg.auto_check_on_start {
             app.resolve_all();
         }
@@ -232,33 +248,22 @@ impl App {
     // ---- persistence ----
 
     pub(crate) fn save_tracks(&self) {
-        let store = Store {
-            config: self.cfg.clone(),
-            tracks: self.tracks.clone(),
-            history: Vec::new(),
-            seeded: false,
-        };
-        store.save_tracks();
+        crate::store::write_tracks(&self.tracks);
+    }
+
+    /// Defer a tracks write to the end of the current frame — see
+    /// `pending_save_tracks`. Use this from anything that runs while the detail
+    /// page is rendering.
+    pub(crate) fn request_save_tracks(&mut self) {
+        self.pending_save_tracks = true;
     }
 
     pub(crate) fn save_history(&self) {
-        let store = Store {
-            config: self.cfg.clone(),
-            tracks: Vec::new(),
-            history: self.history.clone(),
-            seeded: false,
-        };
-        store.save_history();
+        crate::store::write_history(&self.history);
     }
 
     pub(crate) fn save_config(&self) {
-        let store = Store {
-            config: self.cfg.clone(),
-            tracks: Vec::new(),
-            history: Vec::new(),
-            seeded: false,
-        };
-        store.save_config();
+        crate::store::write_config(&self.cfg);
     }
 
     pub(crate) fn toast(&mut self, msg: impl Into<String>) {
@@ -308,58 +313,88 @@ impl App {
         (*self.candidate_sel.get(track_id).unwrap_or(&0)).min(n - 1)
     }
 
+    /// Move the cached candidate view out (or build it once on a miss).
+    pub(crate) fn take_view(&mut self, track_id: &str, sel: usize, base: &Release) -> Release {
+        let hit = matches!(
+            &self.view_cache,
+            Some((id, s, fetched, _)) if id == track_id && *s == sel && *fetched == base.fetched_at
+        );
+        if hit {
+            if let Some((_, _, _, view)) = self.view_cache.take() {
+                return view;
+            }
+        }
+        base.view_of(sel)
+    }
+
+    pub(crate) fn put_view(&mut self, track_id: &str, sel: usize, fetched_at: i64, view: Release) {
+        self.view_cache = Some((track_id.to_owned(), sel, fetched_at, view));
+    }
+
     // ---- downloads ----
 
     /// Queue (or open) one asset. `version` comes from the release *view* the user
-    /// is looking at, which may be a candidate tab rather than the primary pick.
-    pub(crate) fn start_asset(&mut self, track_id: &str, version: &str, asset: &Asset) {
-        let Some(track) = self.track(track_id).cloned() else {
-            return;
-        };
-        let Some(release) = track.release.clone() else {
+    /// Queue (or open) one asset. `version` / `page_url` come from the release
+    /// *view* the user is looking at (a candidate tab rather than the primary pick).
+    ///
+    /// This deliberately takes the release data as arguments instead of reading
+    /// `track.release`: the detail page borrows the release out of the track while it
+    /// renders, so looking it up here would silently find nothing.
+    pub(crate) fn start_asset(
+        &mut self,
+        track_id: &str,
+        version: &str,
+        asset: &Asset,
+        page_url: &str,
+    ) {
+        let Some((app_name, track_url)) = self
+            .track(track_id)
+            .map(|t| (t.name.clone(), t.url.clone()))
+        else {
             return;
         };
         let asset = asset.clone();
         if asset.kind != AssetKind::Direct {
-            let _ = open::that_detached(&asset.url);
-            self.toast(if asset.kind == AssetKind::Pan {
-                "已在浏览器中打开网盘链接"
+            // `magnet:` / `ed2k:` have no browser contract — opening them would run
+            // whatever client the OS registered for the scheme.
+            let is_http = asset.url.starts_with("http://") || asset.url.starts_with("https://");
+            if is_http {
+                safe_open(&asset.url);
+                self.toast(if asset.kind == AssetKind::Pan {
+                    "已在浏览器中打开网盘链接"
+                } else {
+                    "已在浏览器中打开页面"
+                });
             } else {
-                "已在浏览器中打开页面"
-            });
+                self.toast("该链接为磁力/电驴协议，请用「复制」后粘贴到下载工具");
+            }
             return;
         }
         let version = if version.trim().is_empty() {
-            release.version.clone()
+            "未标注版本".to_string()
         } else {
             version.trim().to_string()
         };
         let dir = PathBuf::from(self.cfg.download_dir.trim())
-            .join(crate::download::sanitize(&track.name))
+            .join(crate::download::sanitize(&app_name))
             .join(crate::download::sanitize(&version));
         // Send the browser-equivalent referer for the release actually chosen.
-        let page = release
-            .candidates
-            .iter()
-            .find(|c| c.version == version)
-            .map(|c| c.page_url.clone())
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| release.page_url.clone());
+        let page = if page_url.trim().is_empty() {
+            track_url.clone()
+        } else {
+            page_url.trim().to_string()
+        };
         let id = format!("dl-{}", util::now_secs() as u128 * 1000 + (self.tasks.len() as u128 % 1000));
         let spec = DlSpec {
             id,
-            track_id: track.id.clone(),
-            app: track.name.clone(),
+            track_id: track_id.to_string(),
+            app: app_name,
             version,
             file: asset.name.clone(),
             url: asset.url.clone(),
             dir,
             sha256: asset.sha256.clone(),
-            referer: Some(if page.is_empty() {
-                track.url.clone()
-            } else {
-                page
-            }),
+            referer: Some(page),
         };
         if self
             .tasks
@@ -370,7 +405,13 @@ impl App {
             return;
         }
         self.tasks.insert(0, Task::new(spec));
-        self.toast("已加入下载队列");
+        // Tell the user up-front when the bytes cannot be verified, instead of
+        // implying safety by only mentioning verification when it was possible.
+        if self.tasks[0].spec.sha256.is_none() {
+            self.toast("已加入下载队列（该文件无官方摘要，下载后无法校验）");
+        } else {
+            self.toast("已加入下载队列");
+        }
         self.pump_queue();
     }
 
@@ -489,6 +530,9 @@ impl App {
 
     fn drain(&mut self, ctx: &egui::Context) {
         let mut dirty = false;
+        // Persisting per message meant N full serialisations of tracks.json while a
+        // bulk refresh finished (N = number of items). One write per frame is enough.
+        let mut tracks_dirty = false;
         while let Ok(msg) = self.engine.rx.try_recv() {
             dirty = true;
             match msg {
@@ -506,10 +550,12 @@ impl App {
                         }
                         t.last_error = None;
                         t.last_checked = Some(util::now_secs());
-                        t.release = Some(release.clone());
+                        // Move the release in — it is already owned here, cloning it
+                        // copied the whole changelog plus every candidate.
+                        t.release = Some(release);
                     }
                     self.resolving.remove(&id);
-                    self.save_tracks();
+                    tracks_dirty = true;
                     if let Some((from, to)) = new_version {
                         let name = self
                             .track(&id)
@@ -524,7 +570,7 @@ impl App {
                         t.last_checked = Some(util::now_secs());
                     }
                     self.resolving.remove(&id);
-                    self.save_tracks();
+                    tracks_dirty = true;
                 }
                 UiMsg::DlProgress { id, p } => {
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.spec.id == id) {
@@ -612,6 +658,9 @@ impl App {
                 }
             }
         }
+        if tracks_dirty {
+            self.save_tracks();
+        }
         if dirty {
             ctx.request_repaint();
         }
@@ -690,10 +739,10 @@ impl App {
                 let sel = *self.candidate_sel.get(&id).unwrap_or(&0);
                 let r = t.release.as_ref()?.view_of(sel);
                 let a = r.assets.iter().find(|a| a.kind == AssetKind::Direct)?.clone();
-                Some((id, r.version, a))
+                Some((id, r.version, a, r.page_url))
             });
-            if let Some((id, version, asset)) = target {
-                self.start_asset(&id, &version, &asset);
+            if let Some((id, version, asset, page_url)) = target {
+                self.start_asset(&id, &version, &asset, &page_url);
             } else {
                 self.toast("当前条目没有可直接下载的文件");
             }
@@ -747,6 +796,13 @@ impl eframe::App for App {
         self.central(ctx);
         self.windows(ctx);
         self.toast_overlay(ctx);
+
+        // Flush deferred writes only after every panel has rendered and the detail
+        // page has handed its release back to the track.
+        if self.pending_save_tracks {
+            self.pending_save_tracks = false;
+            self.save_tracks();
+        }
     }
 }
 
@@ -781,13 +837,20 @@ pub(crate) fn dot(ui: &mut egui::Ui, color: Color32) {
     ui.painter().circle_filled(rect.center(), 3.5, color);
 }
 
-pub(crate) fn ellipsis(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+/// Truncate for display without allocating when the string already fits — the
+/// sidebar calls this for every row on every frame, and it used to allocate a
+/// fresh `String` each time even when nothing was cut.
+pub(crate) fn ellipsis(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.chars().count() <= max {
+        return std::borrow::Cow::Borrowed(s);
     }
+    // Cut on a char boundary, leaving one char of room for the ellipsis.
+    let cut = s
+        .char_indices()
+        .nth(max.saturating_sub(1))
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    std::borrow::Cow::Owned(format!("{}…", &s[..cut]))
 }
 
 pub(crate) fn primary_button(text: &str) -> egui::Button<'static> {
@@ -801,6 +864,19 @@ pub(crate) fn subtle_button(text: &str) -> egui::Button<'static> {
         .fill(Color32::from_rgb(0xF2, 0xF4, 0xF8))
         .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(6.0))
+}
+
+/// Open a URL with the system handler, but only when it is plain http(s).
+///
+/// Asset URLs come from third-party pages, and `classify` also accepts `magnet:` /
+/// `ed2k:`; handing those to the shell means running whichever client the OS has
+/// registered for the scheme. Keeping the whitelist here closes that path for every
+/// call site. Local paths (`PathBuf`) still go through `open` directly.
+pub(crate) fn safe_open(url: &str) {
+    let u = url.trim();
+    if u.starts_with("https://") || u.starts_with("http://") {
+        let _ = open::that_detached(u);
+    }
 }
 
 pub(crate) fn make_http(cfg: &Config) -> Arc<Http> {

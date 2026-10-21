@@ -34,14 +34,43 @@ fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
     serde_json::from_str(&text).ok()
 }
 
-fn write_json<T: serde::Serialize>(name: &str, value: &T) {
+fn write_json<T: serde::Serialize + ?Sized>(name: &str, value: &T) {
     let path = data_dir().join(name);
     let tmp = path.with_extension("json.tmp");
-    if let Ok(text) = serde_json::to_string_pretty(value) {
-        if std::fs::write(&tmp, text).is_ok() {
+    let Ok(text) = serde_json::to_string_pretty(value) else {
+        return;
+    };
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // config.json can hold a GitHub token; keep the file owner-only instead of
+        // whatever the ambient umask allows.
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = opts.open(&tmp) {
+        if f.write_all(text.as_bytes()).is_ok() {
+            drop(f);
             let _ = std::fs::rename(&tmp, &path);
         }
     }
+}
+
+// Free functions that borrow the caller's data. `App` used to build a throwaway
+// `Store` (cloning every track, release and changelog) just to persist, which cost
+// a full deep copy per save — and `drain` saves once per resolved item.
+pub fn write_tracks(tracks: &[Track]) {
+    write_json("tracks.json", tracks);
+}
+
+pub fn write_history(history: &[DownloadRecord]) {
+    write_json("history.json", history);
+}
+
+pub fn write_config(config: &Config) {
+    write_json("config.json", config);
 }
 
 pub struct Store {
@@ -49,7 +78,6 @@ pub struct Store {
     pub tracks: Vec<Track>,
     pub history: Vec<DownloadRecord>,
     /// True when tracks came from the shipped default paste (first run).
-    #[allow(dead_code)]
     pub seeded: bool,
 }
 
@@ -79,15 +107,7 @@ impl Store {
     }
 
     pub fn save_config(&self) {
-        write_json("config.json", &self.config);
-    }
-
-    pub fn save_tracks(&self) {
-        write_json("tracks.json", &self.tracks);
-    }
-
-    pub fn save_history(&self) {
-        write_json("history.json", &self.history);
+        write_config(&self.config);
     }
 
     pub fn dir(&self) -> PathBuf {

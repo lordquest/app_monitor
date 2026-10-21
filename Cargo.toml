@@ -7,12 +7,26 @@ authors = ["lordquest <lordquest@163.com>"]
 license = "MIT"
 
 [dependencies]
-# Both backends are compiled in: wgpu (DX12/Metal/Vulkan) is the default because
-# it survives broken WGL drivers, glow stays available via `AM_GL=1`.
+# 双后端，按「DX12 → WARP → glow」顺序兜底（见 src/main.rs 的 RendererChoice）：
+# Windows 上 DX12 覆盖新老显卡，没有显卡时由 WARP 软件光栅化顶上，最后才退 OpenGL。
 eframe = { version = "0.29", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
 egui = "0.29"
+# 只编 DX12 一个后端：绝不能让 wgpu 去枚举 Vulkan —— 老 NVIDIA 驱动（425.31 / Kepler）
+# 在 Vulkan 首帧 present 时会在驱动内部访问违例崩溃，且 panic = "abort" 接不住。
+wgpu = { version = "22.1", default-features = false, features = ["dx12"] }
 # rustls-tls keeps the binary self-contained on Windows / Linux / macOS.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "rustls-tls"] }
+# gzip/brotli/deflate: the HTML parser is the hot path of a resolve, and the
+# download sites serve 100-400KB pages; without decompression every one of them
+# had to be requested with `Accept-Encoding: identity` to avoid unreadable bytes.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "http2",
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "deflate",
+] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

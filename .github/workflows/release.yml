@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # winit / glow / wgpu 在 Linux 上需要 X11 + Wayland + GL 的头文件；
+      # winit / glow 在 Linux 上需要 X11 + Wayland + GL 的头文件；
       # Windows 与 macOS 用 runner 自带的工具链即可。
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
