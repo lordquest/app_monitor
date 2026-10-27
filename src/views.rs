@@ -341,19 +341,86 @@ impl App {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("数据目录").clicked() {
-                            let dir = crate::store::Store {
-                                config: self.cfg.clone(),
-                                tracks: Vec::new(),
-                                history: Vec::new(),
-                                seeded: false,
-                            }
-                            .dir();
-                            let _ = std::fs::create_dir_all(&dir);
+                            let dir = crate::store::data_dir();
+                            let _ = std::fs::create_dir_all(dir);
                             let _ = open::that_detached(dir);
                         }
                     });
                 });
             });
+    }
+
+    // -----------------------------------------------------------------------
+    // Damaged-data banner
+    // -----------------------------------------------------------------------
+
+    /// Shown when a data file could not be read at startup. The loader quarantines
+    /// the original (`*.corrupt`) instead of letting the next save overwrite it, so
+    /// this banner is the user's only cue that something needs a look.
+    pub(crate) fn issue_bar(&mut self, ctx: &egui::Context) {
+        if self.load_issues.is_empty() {
+            return;
+        }
+        let mut dismiss = false;
+        egui::TopBottomPanel::top("load_issues")
+            .frame(
+                egui::Frame::none()
+                    .fill(ORANGE_SOFT)
+                    .inner_margin(Margin::symmetric(18.0, 9.0)),
+            )
+            .show(ctx, |ui| {
+                // Heading line carries the buttons; each detail line then gets the
+                // full panel width so `.wrap()` actually wraps. Putting the buttons
+                // inline with the text pushed them off-screen whenever a serde
+                // message was long, because a horizontal child gets no width limit.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("!").size(14.0).strong().color(ORANGE));
+                    ui.label(
+                        RichText::new(format!(
+                            "{} 个数据文件未能读取，已改用默认内容",
+                            self.load_issues.len()
+                        ))
+                        .size(12.5)
+                        .strong()
+                        .color(TEXT),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("知道了").clicked() {
+                            dismiss = true;
+                        }
+                        if ui.small_button("打开数据目录").clicked() {
+                            let dir = crate::store::data_dir();
+                            let _ = std::fs::create_dir_all(dir);
+                            let _ = open::that_detached(dir);
+                        }
+                    });
+                });
+                for issue in &self.load_issues {
+                    let kept = match &issue.backup {
+                        Some(p) => format!(
+                            "原文件已备份为 {}",
+                            p.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| p.to_string_lossy().to_string())
+                        ),
+                        None => "原文件未能备份，内容保持原样".to_string(),
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "· {} {}，本次使用{}。{}",
+                                issue.file, issue.what, issue.fallback, kept
+                            ))
+                            .size(11.5)
+                            .color(TEXT),
+                        )
+                        .wrap(),
+                    );
+                }
+            });
+        if dismiss {
+            self.load_issues.clear();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1646,13 +1713,5 @@ impl App {
 }
 
 fn data_dir_hint() -> String {
-    crate::store::Store {
-        config: crate::model::Config::default(),
-        tracks: Vec::new(),
-        history: Vec::new(),
-        seeded: false,
-    }
-    .dir()
-    .to_string_lossy()
-    .to_string()
+    crate::store::data_dir().to_string_lossy().to_string()
 }

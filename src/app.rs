@@ -172,6 +172,9 @@ pub struct App {
     pub(crate) settings: SettingsDraft,
     pub(crate) history_filter: String,
     pub(crate) toast: Option<(String, Instant)>,
+    /// Data files that were damaged on disk at startup; shown as a banner until
+    /// dismissed. See `store::LoadIssue`.
+    pub(crate) load_issues: Vec<crate::store::LoadIssue>,
     pub(crate) last_auto: Instant,
     pub(crate) ctx: Option<egui::Context>,
     pub(crate) remove_target: Option<String>,
@@ -215,6 +218,7 @@ impl App {
             show_about: false,
             history_filter: String::new(),
             toast: None,
+            load_issues: store.issues,
             last_auto: Instant::now(),
             ctx: None,
             remove_target: None,
@@ -789,6 +793,7 @@ impl eframe::App for App {
         self.shortcuts(ctx);
 
         self.top_bar(ctx);
+        self.issue_bar(ctx);
         // Bottom panel first: it spans the full width, so the sidebar must be laid
         // out after it or its footer would be covered.
         self.queue_panel(ctx);

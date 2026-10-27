@@ -157,6 +157,8 @@ https://www.423down.com/5228.html 7-Zip                    # 具体文章页
 | `tracks.json` | 追踪清单与最近一次的解析结果（离线也能看到上次数据） |
 | `history.json` | 下载历史（最多 500 条） |
 
+**文件读不动时不会静默清空**：`config.json` / `tracks.json` / `history.json` 只要是非法 JSON（手工改错、被别的程序写坏）或零字节（写到一半断电），程序会先把它改名成 `<原名>.<UTC 时间>Z.corrupt` 留在同目录，再用默认内容启动，并在窗口顶部显示一条横幅说明是哪个文件、备份叫什么。旧版本在这种情况下会直接拿默认清单顶上，下一次保存就把原文件盖掉了——自建的追踪项、Token 会连痕迹都不剩。
+
 配置项（设置窗口 `Ctrl+,`）：
 
 - **下载目录**：默认 `<系统下载目录>/AppMonitor`，可改成任意路径（当前实例已指向工程内 `downloads/`）；文件按 `<软件名>/<版本>/` 归档。
@@ -252,7 +254,7 @@ src/
   parse.rs         粘贴内容 → 追踪项
   provider/        github.rs / site.rs / mod.rs（调度与附件排序）
   model.rs         数据结构、平台判定
-  store.rs         数据目录与 JSON 读写（tmp + rename）
+  store.rs         数据目录与 JSON 读写（tmp + rename，坏文件先隔离再重建）
   util.rs          版本比较、标题打分、字节/时间格式化
 ```
 

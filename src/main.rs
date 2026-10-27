@@ -308,6 +308,9 @@ fn download_cli(track_filter: Option<&str>, asset_filter: Option<&str>) {
 /// summary — handy for debugging providers or wiring this into a scheduled task.
 fn headless_check() {
     let store = store::Store::load();
+    for issue in &store.issues {
+        println!("注意: {} {}，本次使用{}", issue.file, issue.what, issue.fallback);
+    }
     let http = std::sync::Arc::new(
         http::Http::new(&store.config.proxy, None).expect("http client"),
     );
