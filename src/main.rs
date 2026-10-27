@@ -25,7 +25,19 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     if std::env::args().any(|a| a == "--download-test") {
-        download_test();
+        download_cli(None, None);
+        return Ok(());
+    }
+    // `--download <名称> [--asset <子串>]`：真下载某个追踪项的一个附件到 ./.selftest。
+    // 大文件下载出问题时（超时 / 续传 / 校验）这是唯一不依赖界面的复现手段。
+    if let Some(pos) = std::env::args().position(|a| a == "--download") {
+        let name = std::env::args()
+            .nth(pos + 1)
+            .filter(|v| !v.starts_with("--"));
+        let asset = std::env::args()
+            .position(|a| a == "--asset")
+            .and_then(|i| std::env::args().nth(i + 1));
+        download_cli(name.as_deref(), asset.as_deref());
         return Ok(());
     }
     if let Some(pos) = std::env::args().position(|a| a == "--fetch") {
@@ -197,17 +209,37 @@ fn fetch_probe(url: &str, save: Option<&str>) {
 
 /// End-to-end download smoke test: resolves the first GitHub item, downloads its
 /// Windows asset into `./.selftest` and verifies the published SHA-256.
-fn download_test() {
+fn download_cli(track_filter: Option<&str>, asset_filter: Option<&str>) {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     let store = store::Store::load();
-    let http = Arc::new(http::Http::new("", None).expect("http client"));
+    let http = Arc::new(http::Http::new(&store.config.proxy, None).expect("http client"));
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let Some(track) = store.tracks.iter().find(|t| t.kind == model::SourceKind::GitHub) else {
-        println!("没有 GitHub 追踪项");
-        return;
+    let track = match track_filter {
+        Some(f) => {
+            let needle = f.to_lowercase();
+            match store
+                .tracks
+                .iter()
+                .find(|t| t.name.to_lowercase().contains(&needle))
+            {
+                Some(t) => t,
+                None => {
+                    println!("没有匹配「{f}」的追踪项");
+                    return;
+                }
+            }
+        }
+        None => {
+            let Some(t) = store.tracks.iter().find(|t| t.kind == model::SourceKind::GitHub) else {
+                println!("没有 GitHub 追踪项");
+                return;
+            };
+            t
+        }
     };
+    println!("追踪项 {}  ({})", track.name, track.url);
     let release = match rt.block_on(provider::resolve(&http, track)) {
         Ok(r) => r,
         Err(e) => {
@@ -215,11 +247,26 @@ fn download_test() {
             return;
         }
     };
-    let Some(asset) = release.assets.iter().find(|a| {
-        a.kind == model::AssetKind::Direct
-            && (a.name.contains("windows") || a.name.ends_with(".exe") || a.name.ends_with(".msi"))
-    }) else {
-        println!("没有可下载的 Windows 附件");
+    let pick = match asset_filter {
+        Some(f) => {
+            let needle = f.to_lowercase();
+            release
+                .assets
+                .iter()
+                .find(|a| a.kind == model::AssetKind::Direct && a.name.to_lowercase().contains(&needle))
+        }
+        None => release.assets.iter().find(|a| {
+            a.kind == model::AssetKind::Direct
+                && (a.name.contains("windows")
+                    || a.name.ends_with(".exe")
+                    || a.name.ends_with(".msi"))
+        }),
+    };
+    let Some(asset) = pick else {
+        println!("没有匹配的可下载附件");
+        for a in &release.assets {
+            println!("  [{}] {}", a.kind.label(), a.name);
+        }
         return;
     };
     println!(

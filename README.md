@@ -143,6 +143,8 @@ https://www.423down.com/5228.html 7-Zip                    # 具体文章页
 - 直链（`.exe/.zip/.msi/.7z/.dmg/.tar.gz`…）排队下载到 `<下载目录>/<软件名>/<版本>/`，重名自动加 ` (1)`。
 - 网盘链接、网页跳转链接不会偷偷下，只在浏览器打开（`打开链接`）。
 - 下载请求会带上来源页 `Referer` 与站内 Cookie（部分站点防盗链）。
+- **大文件不设总时限**：下载客户端只有 15s 连接超时 + 30s「读停顿」检测，传输本身不限时长（174MB 在 2MB/s 下要 90s，卡总时限会把正常下载掐断）。页面解析仍保留 55s 总时限。
+- **断流自动续传**：中途读超时、对端提前关闭连接时，任务内部带 `Range` 自动接着下（连续 3 次毫无进展或累计 20 次才判定失败），不需要手点「继续」。
 - 已完成任务可 `打开文件` / `打开目录`；失败任务可 `重试`；已结束任务可一键清空。
 
 ## 数据文件
@@ -195,6 +197,7 @@ app-monitor --check HWiNFO     # 只跑名字里含 HWiNFO 的条目
 app-monitor --check --verbose  # 额外打印正文开头与长度，排查站点解析
 app-monitor --fetch <url> [--save out.html]   # 用应用自己的 HTTP 栈抓一个页面，看状态码/标题
 app-monitor --download-test    # 真下载第一个 GitHub 项的 Windows 附件并校验 SHA-256 到 ./.selftest
+app-monitor --download Netcatty --asset win-x64.zip   # 下载指定条目的指定附件（大文件/续传问题复现用）
 app-monitor --select nyaterm              # 打开 GUI 并直接定位到某个条目
 app-monitor --select nyaterm --cand 1     # 再指定打开第 2 个版本候选（截图/复现用）
 ```
@@ -239,7 +242,7 @@ AM_ALLOW_DOWNGRADE=1 app-monitor   # 下载允许 https → http 降级（逃生
 
 ```
 src/
-  main.rs          入口、字体、--check / --download-test
+  main.rs          入口、字体、--check / --download / --download-test / --fetch
   app.rs           应用状态、消息泵、下载队列、快捷键、调色板
   views.rs         全部界面（顶栏 / 侧栏 / 详情 / 队列 / 弹窗）
   engine.rs        后台任务通道（tokio runtime + mpsc）

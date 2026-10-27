@@ -109,7 +109,17 @@ where
     };
 
     let mut restarted = false;
+    let mut attempts = 0u32;
+    // 连续「一点点进展都没有」的次数。有进展就清零——否则用无限重试把真问题
+    // （比如链接每次都 302 到错误页）藏起来。
+    let mut stalls = 0u32;
+    // 本次任务已到达的最大偏移，用来判断一轮重试到底有没有前进。
+    let mut best = have;
+    // 单个任务内的自动续传上限：超过就把控制权交回用户（可点「继续」）。
+    const MAX_ATTEMPTS: u32 = 20;
+    const MAX_STALLS: u32 = 3;
     loop {
+        attempts += 1;
         let mut req = http
             .download_client()
             .get(&spec.url)
@@ -130,11 +140,27 @@ where
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
+                let reason = http::describe_reqwest(e);
+                // 连接层面的抖动（DNS 慢、对端 RST、代理握手失败）值得重试几次；
+                // 连续几次都失败才会浮到界面上。
+                if attempts < 4 {
+                    let wait = (800 * attempts as u64).min(2_000);
+                    log::warn!("下载请求失败（{reason}），{wait}ms 后重试");
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                    if cancel.load(Ordering::Relaxed) {
+                        return Outcome::Canceled {
+                            paused: paused.load(Ordering::Relaxed),
+                            downloaded: have,
+                            total: 0,
+                        };
+                    }
+                    continue;
+                }
                 return Outcome::Failed {
-                    error: http::describe_reqwest(e),
+                    error: reason,
                     downloaded: have,
                     total: 0,
-                }
+                };
             }
         };
         let status = resp.status();
@@ -202,6 +228,10 @@ where
         let mut win_start = Instant::now();
         let mut win_bytes = 0u64;
         let mut speed = 0f64;
+        // 流中断（读超时 / 对端提前关闭）不再直接判定失败：记下原因，写盘之后
+        // 带着 `Range` 自动接着下。174MB 的包在 2MB/s 下要 80 秒，中途抖一下
+        // 就要求用户手点「继续」是不合理的。
+        let mut stream_err: Option<String> = None;
         on_progress(Progress {
             downloaded,
             total,
@@ -220,12 +250,8 @@ where
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = file.flush().await;
-                    return Outcome::Failed {
-                        error: format!("传输中断: {}", http::describe_reqwest(e)),
-                        downloaded,
-                        total,
-                    };
+                    stream_err = Some(format!("传输中断: {}", http::describe_reqwest(e)));
+                    break;
                 }
             };
             if let Err(e) = file.write_all(&bytes).await {
@@ -265,12 +291,49 @@ where
         }
         drop(file);
 
-        if total > 0 && downloaded < total {
-            return Outcome::Failed {
-                error: format!(
-                    "连接提前结束（{}/{}），可点击继续实现断点续传",
+        // ---- 要不要自动续传 ----
+        let short = total > 0 && downloaded < total;
+        let interrupted = stream_err.is_some() || short;
+        if interrupted {
+            let reason = match stream_err {
+                Some(e) => e,
+                None => format!(
+                    "连接提前结束（{}/{}）",
                     crate::util::fmt_bytes(downloaded),
                     crate::util::fmt_bytes(total)
+                ),
+            };
+            if downloaded > best {
+                best = downloaded;
+                stalls = 0;
+            } else {
+                stalls += 1;
+            }
+            if stalls < MAX_STALLS && attempts < MAX_ATTEMPTS {
+                log::warn!(
+                    "{reason}，自动续传（第 {attempts} 次，已到 {}）",
+                    crate::util::fmt_bytes(downloaded)
+                );
+                // 下一次请求改成 `Range: bytes=<downloaded>-`。
+                have = downloaded;
+                // 短暂退避，别在站点刚 RST 时立刻又撞上去（封顶 2s，取消要能立刻生效）。
+                tokio::time::sleep(Duration::from_millis(
+                    (400 * attempts as u64).min(2_000),
+                ))
+                .await;
+                if cancel.load(Ordering::Relaxed) {
+                    return Outcome::Canceled {
+                        paused: paused.load(Ordering::Relaxed),
+                        downloaded,
+                        total,
+                    };
+                }
+                continue;
+            }
+            return Outcome::Failed {
+                error: format!(
+                    "{reason}；已下载 {}，可点击「继续」断点续传",
+                    crate::util::fmt_bytes(downloaded)
                 ),
                 downloaded,
                 total,
@@ -522,6 +585,141 @@ mod tests {
         assert_eq!(sanitize("con"), "_con");
         // A name that merely starts with a device name is fine.
         assert_eq!(sanitize("console.zip"), "console.zip");
+    }
+
+    // ---- 大文件：断流自动续传 / 无进展及时放弃 ----
+
+    /// 极简 HTTP 服务：`cut` 表示"这次只发这么多字节就断开"，`honor_range` 决定是否支持 Range。
+    fn spawn_server(
+        body: Vec<u8>,
+        cut: Option<usize>,
+        honor_range: bool,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let range = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split('=').nth(1))
+                    .and_then(|v| v.split('-').next())
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+                let start = if honor_range { range.unwrap_or(0) } else { 0 };
+                let rest = &body[start.min(body.len())..];
+                let send = match cut {
+                    Some(c) => &rest[..c.min(rest.len())],
+                    None => rest,
+                };
+                let head = if start > 0 {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        start,
+                        body.len().saturating_sub(1),
+                        body.len(),
+                        rest.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        rest.len()
+                    )
+                };
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(send);
+                let _ = s.flush();
+                // 提前关闭连接：模拟对端中途断开 / 读超时。
+            }
+        });
+        (format!("http://{addr}/big.bin"), handle)
+    }
+
+    fn spec_for(url: &str, dir: &Path) -> DlSpec {
+        DlSpec {
+            id: "t".into(),
+            track_id: "t".into(),
+            app: "big".into(),
+            version: "1".into(),
+            file: "big.bin".into(),
+            url: url.to_string(),
+            dir: dir.to_path_buf(),
+            sha256: None,
+            referer: None,
+        }
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "app-monitor-{tag}-{}-{}",
+            std::process::id(),
+            crate::util::now_secs()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 第一次只给 40% 就断线，第二次带着 Range 拿下剩余部分 —— 中间不该报失败。
+    #[tokio::test]
+    async fn resumes_after_connection_drops() {
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let cut_at = 120_000;
+        let (url, _h) = spawn_server(body.clone(), Some(cut_at), true);
+        let dir = tmpdir("resume");
+        let http = Http::new("", None).unwrap();
+        let spec = spec_for(&url, &dir);
+
+        let outcome = run(
+            &http,
+            &spec,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            |_p| {},
+        )
+        .await;
+
+        match outcome {
+            Outcome::Done { size, path, .. } => {
+                assert_eq!(size, body.len() as u64, "续传后大小不对");
+                let got = std::fs::read(&path).unwrap();
+                assert_eq!(got, body, "续传拼出来的内容不对");
+            }
+            other => panic!("应当自动续传成功，实际 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 每次都一点不给就断线 → 三轮之后放弃，而不是无限重试。
+    #[tokio::test]
+    async fn gives_up_when_no_progress() {
+        let body = vec![7u8; 200_000];
+        let (url, _h) = spawn_server(body.clone(), Some(0), true);
+        let dir = tmpdir("stall");
+        let http = Http::new("", None).unwrap();
+        let spec = spec_for(&url, &dir);
+
+        let outcome = run(
+            &http,
+            &spec,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            |_p| {},
+        )
+        .await;
+
+        match outcome {
+            Outcome::Failed { error, .. } => {
+                assert!(error.contains("可点击「继续」"), "错误缺少续传提示: {error}");
+            }
+            other => panic!("应当失败，实际 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Two downloads that resolve to the same filename must not share a `.part`.

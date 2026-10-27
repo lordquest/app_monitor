@@ -26,11 +26,30 @@ const MAX_JSON_BODY: usize = 2 * 1024 * 1024;
 /// stall the resolve queue for a day.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
+/// 客户端用途。两种用途的超时语义完全不同，混用会有真实后果：
+/// 页面请求要「总时限」（防止慢边缘一直吊着解析队列），下载要「停顿检测」
+/// （174MB 的包在 2MB/s 下要 80 秒，总时限一到就会把好好的传输掐断）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClientRole {
+    /// HTML / JSON：从连接开始到尾包读完的总时限 55s。
+    Page,
+    /// 安装包：不设总时限，只在连续 30s 读不到任何字节时判定为卡死。
+    Download,
+}
+
+/// `(总时限, 读停顿时限)`。
+fn timeouts(role: ClientRole) -> (Option<Duration>, Option<Duration>) {
+    match role {
+        ClientRole::Page => (Some(Duration::from_secs(55)), None),
+        ClientRole::Download => (None, Some(Duration::from_secs(30))),
+    }
+}
+
 pub struct Http {
+    /// 解析用：严格跳转策略 + 总时限。
     pub client: Client,
-    /// 下载专用客户端，仅在 `AM_ALLOW_DOWNGRADE=1` 时存在（放宽了「拒绝 https → http」）。
-    /// 用 `Option` 而不是永远建两个，是为了默认情况下不多一份连接池与 TLS 配置。
-    relax: Option<Client>,
+    /// 下载用：跳转策略可被 `AM_ALLOW_DOWNGRADE=1` 放宽，且**没有总时限**。
+    download: Client,
     /// host → (cookie name, value). Stored per name so a repeated `Set-Cookie`
     /// replaces the old value instead of piling up duplicate pairs.
     cookies: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -102,14 +121,24 @@ fn redirect_policy(allow_downgrade: bool) -> reqwest::redirect::Policy {
     })
 }
 
-fn build_client(proxy: &str, allow_downgrade: bool) -> Result<Client, String> {
+fn build_client(
+    proxy: &str,
+    allow_downgrade: bool,
+    role: ClientRole,
+) -> Result<Client, String> {
+    let (total, read) = timeouts(role);
     let mut b = Client::builder()
         .user_agent(UA)
-        // Some fronted sites (Cloudflare with a slow edge) take 40s+ to
-        // first byte; the request-level timeout below is the real guard.
-        .timeout(Duration::from_secs(55))
         .connect_timeout(Duration::from_secs(15))
         .redirect(redirect_policy(allow_downgrade));
+    // 总时限：Some 才设置。下载必须留 None——reqwest 的 timeout 是「总 deadline」，
+    // 覆盖到响应体读完为止，大文件必然超时（实测 174MB @2MB/s 需要 80s）。
+    if let Some(t) = total {
+        b = b.timeout(t);
+    }
+    if let Some(t) = read {
+        b = b.read_timeout(t);
+    }
     if !proxy.trim().is_empty() {
         b = b.proxy(
             reqwest::Proxy::all(proxy.trim()).map_err(|e| format!("代理地址无效: {e}"))?,
@@ -121,24 +150,23 @@ fn build_client(proxy: &str, allow_downgrade: bool) -> Result<Client, String> {
 
 impl Http {
     pub fn new(proxy: &str, token: Option<String>) -> Result<Self, String> {
-        let client = build_client(proxy, false)?;
-        let relax = if downgrade_allowed() {
+        let client = build_client(proxy, false, ClientRole::Page)?;
+        let allow_downgrade = downgrade_allowed();
+        if allow_downgrade {
             log::warn!("AM_ALLOW_DOWNGRADE 已设置：下载允许 https → http 降级跳转（包体可被中途替换）");
-            Some(build_client(proxy, true)?)
-        } else {
-            None
-        };
+        }
+        let download = build_client(proxy, allow_downgrade, ClientRole::Download)?;
         Ok(Self {
             client,
-            relax,
+            download,
             cookies: Mutex::new(HashMap::new()),
             token,
         })
     }
 
-    /// 下载器要用的客户端：默认与解析同一个，只有 `AM_ALLOW_DOWNGRADE=1` 才换成放宽的那个。
+    /// 下载器要用的客户端：不限总时长，只做停顿检测；跳转策略受逃生阀控制。
     pub fn download_client(&self) -> &Client {
-        self.relax.as_ref().unwrap_or(&self.client)
+        &self.download
     }
 
     fn cookie_for(&self, host: &str) -> Option<String> {
@@ -431,18 +459,24 @@ mod tests {
         assert_eq!(redirect_verdict(&next, &prev, true), Ok(()));
     }
 
-    /// 解析永远严格：即便开了逃生阀，页面抓取用的也是不带 relax 的那个客户端。
+    /// 解析与下载必须是两个不同超时策略的客户端。
+    ///
+    /// 这里锁的是曾经把 174MB 安装包「下载失败」的根因：reqwest 的 `timeout()` 是
+    /// 总 deadline（连到响应体读完），把它套在下载上，凡是大到 55 秒下不完的文件
+    /// 必定报「传输中断: 请求超时」，且每次重试都一样。
     #[test]
-    fn parse_client_stays_strict_even_with_escape_hatch() {
+    fn download_client_has_no_total_deadline() {
+        let (page_total, page_read) = timeouts(ClientRole::Page);
+        assert_eq!(page_total, Some(Duration::from_secs(55)));
+        assert_eq!(page_read, None, "页面请求靠总时限兜底，不需要读停顿检测");
+
+        let (dl_total, dl_read) = timeouts(ClientRole::Download);
+        assert_eq!(dl_total, None, "下载不能有总时限，否则大文件必然被掐断");
+        assert_eq!(dl_read, Some(Duration::from_secs(30)), "卡死仍要能被发现");
+
+        // 两个客户端永远是不同实例（用途不同），且解析用的那个不受逃生阀影响。
         let http = Http::new("", None).unwrap();
-        // relax 只在开关打开时存在，默认必须是 None —— 否则等于永久放宽。
-        if downgrade_allowed() {
-            assert!(http.relax.is_some(), "开了逃生阀却没有放宽的客户端");
-        } else {
-            assert!(http.relax.is_none());
-            // 同一个客户端：解析与下载共用严格策略。
-            assert!(std::ptr::eq(&http.client, http.download_client()));
-        }
+        assert!(!std::ptr::eq(&http.client, http.download_client()));
     }
 
     #[test]
