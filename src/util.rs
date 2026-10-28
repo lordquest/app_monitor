@@ -41,16 +41,17 @@ pub fn fmt_speed(bps: f64) -> String {
 }
 
 pub fn fmt_secs_ago(ts: i64) -> String {
+    use crate::i18n::t;
     if ts <= 0 {
-        return "从未".into();
+        return t("从未", "never").into();
     }
     let d = now_secs() - ts;
     match d {
-        d if d < 0 => "刚刚".into(),
-        d if d < 60 => "刚刚".into(),
-        d if d < 3600 => format!("{} 分钟前", d / 60),
-        d if d < 86400 => format!("{} 小时前", d / 3600),
-        d if d < 86400 * 30 => format!("{} 天前", d / 86400),
+        d if d < 0 => t("刚刚", "just now").into(),
+        d if d < 60 => t("刚刚", "just now").into(),
+        d if d < 3600 => crate::i18n::t1("{} 分钟前", "{} min ago", d / 60),
+        d if d < 86400 => crate::i18n::t1("{} 小时前", "{} h ago", d / 3600),
+        d if d < 86400 * 30 => crate::i18n::t1("{} 天前", "{} d ago", d / 86400),
         _ => fmt_date(ts),
     }
 }

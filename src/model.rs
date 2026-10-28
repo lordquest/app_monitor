@@ -24,8 +24,8 @@ impl SourceKind {
     pub fn label(self) -> &'static str {
         match self {
             SourceKind::GitHub => "GitHub",
-            SourceKind::Site => "站点搜索",
-            SourceKind::Article => "页面",
+            SourceKind::Site => crate::i18n::t("站点搜索", "site search"),
+            SourceKind::Article => crate::i18n::t("页面", "page"),
         }
     }
 }
@@ -45,9 +45,9 @@ pub enum AssetKind {
 impl AssetKind {
     pub fn label(self) -> &'static str {
         match self {
-            AssetKind::Direct => "直链",
-            AssetKind::Page => "页面",
-            AssetKind::Pan => "网盘",
+            AssetKind::Direct => crate::i18n::t("直链", "direct"),
+            AssetKind::Page => crate::i18n::t("页面", "page"),
+            AssetKind::Pan => crate::i18n::t("网盘", "net disk"),
         }
     }
 }
@@ -107,9 +107,16 @@ pub struct Candidate {
 impl Candidate {
     /// Short tab caption: `1.3.0 稳定` / `2.0.0-preview.7 预览`.
     pub fn tab_label(&self) -> String {
-        let channel = if self.prerelease { "预览" } else { "稳定" };
+        let channel = if self.prerelease {
+            crate::i18n::t("预览", "preview")
+        } else {
+            crate::i18n::t("稳定", "stable")
+        };
         if self.version.trim().is_empty() {
             channel.to_string()
+        } else if crate::i18n::is_en() {
+            // 英文里版本号与频道之间习惯用空格而不是直接连着写。
+            format!("{} · {channel}", self.version.trim())
         } else {
             format!("{} {channel}", self.version.trim())
         }
@@ -242,6 +249,24 @@ pub struct Config {
     pub check_interval_min: u64,
     /// Prefer assets matching the current OS when auto-selecting a file.
     pub prefer_current_os: bool,
+    /// 界面缩放系数：字号与几处固定尺寸在「设计值」上乘它。1.0 = 默认。
+    ///
+    /// 高 DPI 屏上 GPUI 已经把逻辑像素换成物理像素了（150% 时 1 逻辑像素 =
+    /// 1.5 物理像素），所以这里**不是** DPI 系数 —— 它是「字号再大一点」的那个
+    /// 一点：11 逻辑像素在 4K 屏上照样小，用户得能自己调。
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    /// 界面语言，`zh` / `en`。空串与未知值都按中文处理。
+    #[serde(default = "default_lang")]
+    pub lang: String,
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+fn default_lang() -> String {
+    "zh".to_string()
 }
 
 impl Default for Config {
@@ -260,6 +285,8 @@ impl Default for Config {
             auto_check_on_start: true,
             check_interval_min: 60,
             prefer_current_os: true,
+            ui_scale: default_ui_scale(),
+            lang: default_lang(),
         }
     }
 }

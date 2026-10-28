@@ -4,6 +4,7 @@ mod download;
 mod engine;
 mod html;
 mod http;
+mod i18n;
 mod model;
 mod parse;
 mod provider;

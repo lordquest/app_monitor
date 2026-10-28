@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,9 +27,44 @@ use gpui::{
 use crate::download::DlSpec;
 use crate::engine::{Engine, UiMsg};
 use crate::http::Http;
+use crate::i18n::{self, t};
 use crate::model::{Asset, AssetKind, Config, DownloadRecord, Release, Track};
 use crate::store::Store;
 use crate::util;
+
+// ---------------------------------------------------------------------------
+// 界面缩放
+// ---------------------------------------------------------------------------
+
+/// 界面缩放系数，进程级。用静态量而非字段的理由与 `i18n` 相同：界面只有一个
+/// 窗口，而 `badge()` / `chip()` 这些自由函数没有 `self`。
+///
+/// 它**不是** DPI 系数 —— GPUI 已经按系统缩放把逻辑像素换算成物理像素了
+/// （150% 时 1 逻辑像素 = 1.5 物理像素）。这里管的是另一件事：11 逻辑像素
+/// 在 4K 屏上照样嫌小，用户得能自己把它调大。
+static SCALE: AtomicU32 = AtomicU32::new(0x3F80_0000); // f32 1.0 的位模式
+
+const SCALE_MIN: f32 = 0.8;
+const SCALE_MAX: f32 = 1.8;
+const SCALE_STEP: f32 = 0.1;
+
+pub fn set_ui_scale(s: f32) {
+    let clamped = if s.is_finite() {
+        s.clamp(SCALE_MIN, SCALE_MAX)
+    } else {
+        1.0
+    };
+    SCALE.store(clamped.to_bits(), Ordering::Relaxed);
+}
+
+fn scale() -> f32 {
+    f32::from_bits(SCALE.load(Ordering::Relaxed))
+}
+
+/// 设计值 → 实际逻辑像素。字号、行高、输入框高度、侧栏宽度都过这里。
+fn sp(n: f32) -> Pixels {
+    px(n * scale())
+}
 
 /// 下载任务状态。原先定义在 egui 的 `app.rs` 里（那时两套前端共用）；egui 版
 /// 删掉后就留在界面层，`download` / `engine` 不关心它。
@@ -46,12 +81,12 @@ pub enum TaskStatus {
 impl TaskStatus {
     fn label(self) -> &'static str {
         match self {
-            TaskStatus::Queued => "排队中",
-            TaskStatus::Running => "下载中",
-            TaskStatus::Paused => "已暂停",
-            TaskStatus::Done => "已完成",
-            TaskStatus::Failed => "失败",
-            TaskStatus::Canceled => "已取消",
+            TaskStatus::Queued => t("排队中", "queued"),
+            TaskStatus::Running => t("下载中", "downloading"),
+            TaskStatus::Paused => t("已暂停", "paused"),
+            TaskStatus::Done => t("已完成", "done"),
+            TaskStatus::Failed => t("失败", "failed"),
+            TaskStatus::Canceled => t("已取消", "canceled"),
         }
     }
 }
@@ -109,6 +144,36 @@ fn status_color(s: TaskStatus) -> u32 {
     }
 }
 
+/// 写进 `history.json` 的状态。**存中文常量，不存界面语言**：历史文件是跨语言
+/// 共用的，存了 "done" 之后再切回中文就没法还原了。显示时由 `status_text` 翻。
+#[derive(Clone, Copy)]
+enum RecordStatus {
+    Done,
+    Failed,
+    Canceled,
+}
+
+impl RecordStatus {
+    fn stored(self) -> &'static str {
+        match self {
+            RecordStatus::Done => "完成",
+            RecordStatus::Failed => "失败",
+            RecordStatus::Canceled => "已取消",
+        }
+    }
+}
+
+/// 历史行上的状态文字：库里的值转成当前语言。
+fn status_text(stored: &str) -> String {
+    match stored {
+        "完成" => t("完成", "done").to_string(),
+        "失败" => t("失败", "failed").to_string(),
+        "已取消" => t("已取消", "canceled").to_string(),
+        // 认不出来的取值原样显示，总比显示空白好查。
+        other => other.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 调色板：沿用 v0.1 的配色（浅灰底 + 白卡片 + 蓝色强调），老用户不会觉得换了软件。
 // ---------------------------------------------------------------------------
@@ -140,9 +205,9 @@ enum Tab {
 impl Tab {
     fn label(self) -> &'static str {
         match self {
-            Tab::Overview => "概览",
-            Tab::Notes => "更新说明",
-            Tab::History => "历史版本",
+            Tab::Overview => t("概览", "Overview"),
+            Tab::Notes => t("更新说明", "What's new"),
+            Tab::History => t("历史版本", "Versions"),
         }
     }
 }
@@ -357,6 +422,38 @@ impl TextField {
     }
 }
 
+/// 复制按钮的回执文案：「已复制 **什么**」里的那个什么。
+///
+/// 不用 `&str` 传，是因为中英语序不同 —— 调用处只写中文的话，英文界面就会
+/// 冒出「Copied 版本号」这种半截翻译。
+#[derive(Clone)]
+enum What {
+    Version,
+    PageLink,
+    Notes,
+    AssetLink(String),
+}
+
+impl What {
+    fn zh(&self) -> String {
+        match self {
+            What::Version => "版本号".into(),
+            What::PageLink => "来源页链接".into(),
+            What::Notes => "更新说明".into(),
+            What::AssetLink(name) => format!("「{name}」的链接"),
+        }
+    }
+
+    fn en(&self) -> String {
+        match self {
+            What::Version => "version number".into(),
+            What::PageLink => "source page link".into(),
+            What::Notes => "release notes".into(),
+            What::AssetLink(name) => format!("link to \"{name}\""),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FieldId {
     AddInput,
@@ -419,11 +516,26 @@ pub struct App {
 
     /// 自动检查的计时起点。
     last_auto: Instant,
+    /// 窗口标题上一次是按哪种语言设的。切换语言时要在 `render` 里重设一次
+    /// （`&mut Window` 只在绘制阶段拿得到），而每帧都设一遍会白打扰系统。
+    title_lang: Option<i18n::Lang>,
 }
 
 impl App {
     fn new(cx: &mut Context<Self>) -> Self {
         let store = Store::load();
+        // 语言与缩放是全局的（见 i18n / SCALE 的注释），必须赶在第一次绘制之前生效。
+        // 环境变量优先，方便截图与排障时临时切换，不去动 config.json。
+        let lang = std::env::var("AM_LANG")
+            .map(|v| i18n::Lang::from_code(&v))
+            .unwrap_or_else(|_| i18n::Lang::from_code(&store.config.lang));
+        i18n::set(lang);
+        set_ui_scale(
+            std::env::var("AM_UI_SCALE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(store.config.ui_scale),
+        );
         if store.seeded {
             crate::store::write_tracks(&store.tracks);
         }
@@ -462,7 +574,16 @@ impl App {
             tab: Tab::Overview,
             candidate_sel,
             issues: store.issues,
-            toast: http_err.map(|e| (format!("代理设置无效，本次改用直连：{e}"), Instant::now())),
+            toast: http_err.map(|e| {
+                (
+                    crate::i18n::t1(
+                        "代理设置无效，本次改用直连：{}",
+                        "Proxy settings are invalid, using a direct connection: {}",
+                        e,
+                    ),
+                    Instant::now(),
+                )
+            }),
             engine: Engine::new(),
             http,
             tasks: Vec::new(),
@@ -479,6 +600,7 @@ impl App {
             add_skipped: Vec::new(),
             confirm_delete: None,
             last_auto: Instant::now(),
+            title_lang: None,
         };
         app.spawn_pump(cx);
         if auto {
@@ -596,13 +718,25 @@ impl App {
                         let name = task.spec.file.clone();
                         self.toast = Some((
                             match sha_ok {
-                                Some(true) => format!("{name} 下载完成，SHA-256 校验通过"),
-                                Some(false) => format!("{name} 下载完成，但 SHA-256 不一致"),
-                                None => format!("{name} 下载完成（无官方摘要）"),
+                                Some(true) => crate::i18n::t1(
+                                    "{} 下载完成，SHA-256 校验通过",
+                                    "{} downloaded — SHA-256 verified",
+                                    &name,
+                                ),
+                                Some(false) => crate::i18n::t1(
+                                    "{} 下载完成，但 SHA-256 不一致",
+                                    "{} downloaded, but the SHA-256 does not match",
+                                    &name,
+                                ),
+                                None => crate::i18n::t1(
+                                    "{} 下载完成（无官方摘要）",
+                                    "{} downloaded (no official checksum)",
+                                    &name,
+                                ),
                             },
                             Instant::now(),
                         ));
-                        self.record_history(&task, "完成", None);
+                        self.record_history(&task, RecordStatus::Done, None);
                     }
                     changed = true;
                 }
@@ -622,7 +756,7 @@ impl App {
                         snap = Some(task.clone());
                     }
                     if let Some(task) = snap {
-                        self.record_history(&task, "失败", Some(error));
+                        self.record_history(&task, RecordStatus::Failed, Some(error));
                     }
                     changed = true;
                 }
@@ -648,7 +782,7 @@ impl App {
                         }
                     }
                     if let Some(task) = snap {
-                        self.record_history(&task, "已取消", None);
+                        self.record_history(&task, RecordStatus::Canceled, None);
                     }
                     changed = true;
                 }
@@ -671,14 +805,14 @@ impl App {
             .cloned()
             .collect();
         if pending.is_empty() {
-            self.toast("全部条目都在检查中", cx);
+            self.toast(t("全部条目都在检查中", "Every tracked item is already being checked"), cx);
             return;
         }
         for t in pending {
             self.resolving.insert(t.id.clone());
             self.engine.start_resolve(self.http.clone(), t);
         }
-        self.toast("已开始检查全部追踪项", cx);
+        self.toast(t("已开始检查全部追踪项", "Checking every tracked item"), cx);
     }
 
     fn resolve_one(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -717,19 +851,25 @@ impl App {
                 let _ = open::that_detached(&asset.url);
                 self.toast(
                     if asset.kind == AssetKind::Pan {
-                        "已在浏览器中打开网盘链接"
+                        t("已在浏览器中打开网盘链接", "Opened the net-disk link in your browser")
                     } else {
-                        "已在浏览器中打开页面"
+                        t("已在浏览器中打开页面", "Opened the page in your browser")
                     },
                     cx,
                 );
             } else {
-                self.toast("该链接为磁力/电驴协议，请用「复制」后粘贴到下载工具", cx);
+                self.toast(
+                    t(
+                        "该链接为磁力/电驴协议，请用「复制」后粘贴到下载工具",
+                        "That is a magnet/ed2k link — use Copy and paste it into a download tool",
+                    ),
+                    cx,
+                );
             }
             return;
         }
         let version = if version.trim().is_empty() {
-            "未标注版本".to_string()
+            t("未标注版本", "untagged").to_string()
         } else {
             version.trim().to_string()
         };
@@ -761,16 +901,19 @@ impl App {
             .iter()
             .any(|t| t.spec.url == spec.url && matches!(t.status, TaskStatus::Running | TaskStatus::Queued))
         {
-            self.toast("该文件已在下载队列中", cx);
+            self.toast(t("该文件已在下载队列中", "That file is already in the download queue"), cx);
             return;
         }
         let missing_sha = spec.sha256.is_none();
         self.tasks.insert(0, DlTask::new(spec));
         self.toast(
             if missing_sha {
-                "已加入下载队列（该文件无官方摘要，下载后无法校验）"
+                t(
+                    "已加入下载队列（该文件无官方摘要，下载后无法校验）",
+                    "Added to the queue — no official checksum, so the file can't be verified",
+                )
             } else {
-                "已加入下载队列"
+                t("已加入下载队列", "Added to the download queue")
             },
             cx,
         );
@@ -945,18 +1088,35 @@ impl App {
     fn submit_add(&mut self, cx: &mut Context<Self>) {
         let text = self.add_input.text().to_string();
         if text.trim().is_empty() {
-            self.toast("先粘贴要追踪的页面、仓库或软件站地址", cx);
+            self.toast(
+                t(
+                    "先粘贴要追踪的页面、仓库或软件站地址",
+                    "Paste a page, repository or download-site URL to track first",
+                ),
+                cx,
+            );
             return;
         }
         let parsed = crate::parse::parse_input(&text);
         if parsed.tracks.is_empty() {
             self.add_skipped = parsed.skipped.clone();
-            let detail = if parsed.skipped.is_empty() {
+            let skipped = parsed.skipped.join(" / ");
+            let detail = if skipped.is_empty() {
                 String::new()
+            } else if i18n::is_en() {
+                // 英文用半角括号与空格，中文用全角括号，两边都不别扭。
+                format!(" ({skipped})")
             } else {
-                format!("（{}）", parsed.skipped.join(" / "))
+                format!("（{skipped}）")
             };
-            self.toast(format!("没能识别出可追踪的地址{detail}"), cx);
+            self.toast(
+                if i18n::is_en() {
+                    format!("No trackable URL found{detail}")
+                } else {
+                    format!("没能识别出可追踪的地址{detail}")
+                },
+                cx,
+            );
             return;
         }
         let known: Vec<String> = self
@@ -984,7 +1144,11 @@ impl App {
 
         if added == 0 {
             self.toast(
-                format!("没有新增条目（{dup} 个已在列表里）"),
+                if i18n::is_en() {
+                    format!("Nothing new — all {dup} are already tracked")
+                } else {
+                    format!("没有新增条目（{dup} 个已在列表里）")
+                },
                 cx,
             );
             return;
@@ -995,7 +1159,13 @@ impl App {
         self.dialog = None;
         self.toast(
             if dup > 0 {
-                format!("已添加 {added} 个追踪项，跳过 {dup} 个重复项")
+                if i18n::is_en() {
+                    format!("Added {added} item(s), skipped {dup} duplicate(s)")
+                } else {
+                    format!("已添加 {added} 个追踪项，跳过 {dup} 个重复项")
+                }
+            } else if i18n::is_en() {
+                format!("Added {added} item(s), checking versions…")
             } else {
                 format!("已添加 {added} 个追踪项，开始检查版本…")
             },
@@ -1007,7 +1177,7 @@ impl App {
     fn submit_settings(&mut self, cx: &mut Context<Self>) {
         let dir = self.set_dir.text().trim().to_string();
         if dir.is_empty() {
-            self.toast("下载目录不能为空", cx);
+            self.toast(t("下载目录不能为空", "The download folder cannot be empty"), cx);
             return;
         }
         self.cfg.download_dir = dir;
@@ -1016,13 +1186,16 @@ impl App {
         let (http, err) = make_http(&self.cfg);
         if let Some(e) = err {
             // 代理填错时不要静默退回直连：那会让用户以为设置生效了。
-            self.toast(format!("代理或 Token 无效：{e}"), cx);
+            self.toast(
+                crate::i18n::t1("代理或 Token 无效：{}", "Proxy or token is invalid: {}", e),
+                cx,
+            );
             return;
         }
         self.http = http;
         crate::store::write_config(&self.cfg);
         self.dialog = None;
-        self.toast("设置已保存", cx);
+        self.toast(t("设置已保存", "Settings saved"), cx);
     }
 
     fn delete_track(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1038,10 +1211,17 @@ impl App {
             self.selected = self.tracks.first().map(|t| t.id.clone());
         }
         crate::store::write_tracks(&self.tracks);
-        self.toast(format!("已删除「{name}」"), cx);
+        self.toast(
+            if i18n::is_en() {
+                format!("Deleted \"{name}\" and its local record")
+            } else {
+                format!("已删除「{name}」")
+            },
+            cx,
+        );
     }
 
-    fn record_history(&mut self, task: &DlTask, status: &str, error: Option<String>) {
+    fn record_history(&mut self, task: &DlTask, status: RecordStatus, error: Option<String>) {
         let rec = DownloadRecord {
             id: task.spec.id.clone(),
             app: task.spec.app.clone(),
@@ -1052,7 +1232,7 @@ impl App {
             size: task.downloaded,
             started_at: task.started_at,
             finished_at: util::now_secs(),
-            status: status.to_string(),
+            status: status.stored().to_string(),
             sha_ok: task.sha_ok,
             error,
         };
@@ -1115,14 +1295,48 @@ impl App {
     }
 
     /// 写剪贴板。GPUI 0.2 还没有文本选中，凡是可能想复制走的文本都给一个按钮。
-    fn copy(&mut self, text: impl Into<String>, what: &str, cx: &mut Context<Self>) {
+    fn copy(&mut self, text: impl Into<String>, what: What, cx: &mut Context<Self>) {
         let text = text.into();
-        if text.trim().is_empty() {
-            self.toast(format!("没有可复制的{what}"), cx);
+        let msg = if text.trim().is_empty() {
+            if i18n::is_en() {
+                format!("Nothing to copy — no {}", what.en())
+            } else {
+                format!("没有可复制的{}", what.zh())
+            }
+        } else {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            if i18n::is_en() {
+                format!("Copied {}", what.en())
+            } else {
+                format!("已复制{}", what.zh())
+            }
+        };
+        self.toast(msg, cx);
+    }
+
+    /// 切界面语言。立刻生效并落盘 —— 语言没有「取消」这种半程状态。
+    fn set_lang(&mut self, lang: i18n::Lang, cx: &mut Context<Self>) {
+        if i18n::current() == lang {
             return;
         }
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        self.toast(format!("已复制{what}"), cx);
+        i18n::set(lang);
+        self.cfg.lang = lang.code().to_string();
+        crate::store::write_config(&self.cfg);
+        cx.notify();
+    }
+
+    /// 调整界面缩放。0.1 的浮点累加会留下 1.2000000000000002 这种尾巴，
+    /// 所以每步都四舍五入回一位小数，免得设置里显示成 120.0000001%。
+    fn nudge_scale(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let next = ((self.cfg.ui_scale + delta) * 10.0).round() / 10.0;
+        let next = next.clamp(SCALE_MIN, SCALE_MAX);
+        if (next - self.cfg.ui_scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.cfg.ui_scale = next;
+        set_ui_scale(next);
+        crate::store::write_config(&self.cfg);
+        cx.notify();
     }
 
     fn update_count(&self) -> usize {
@@ -1151,42 +1365,68 @@ impl App {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(18.))
+                            .text_size(sp(20.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
                             .child("App Monitor"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(12.5))
                             .text_color(rgb(MUTED))
-                            .child("跨平台软件追踪下载器"),
+                            .child(t("跨平台软件追踪下载器", "Cross-platform release tracker")),
                     ),
             )
-            .child(badge(format!("{total} 个追踪项"), MUTED, 0xF2F4F8))
+            .child(badge(
+                if i18n::is_en() {
+                    format!(
+                        "{total} item{}",
+                        if total == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!("{total} 个追踪项")
+                },
+                MUTED,
+                0xF2F4F8,
+            ))
             .when(updates > 0, |d| {
-                d.child(badge(format!("{updates} 项有更新"), ORANGE, ORANGE_SOFT))
+                d.child(badge(
+                    if i18n::is_en() {
+                        format!(
+                            "{updates} update{}",
+                            if updates == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        format!("{updates} 项有更新")
+                    },
+                    ORANGE,
+                    ORANGE_SOFT,
+                ))
             })
             .child(div().flex_1())
             .when(!self.resolving.is_empty(), |d| {
                 d.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(12.5))
                         .text_color(rgb(ACCENT))
-                        .child(format!("检查中 {}…", self.resolving.len())),
+                        .child(if i18n::is_en() {
+                            format!("Checking {}…", self.resolving.len())
+                        } else {
+                            format!("检查中 {}…", self.resolving.len())
+                        }),
                 )
             })
             .child(
-                btn("btn-check", "检查全部更新", ACCENT, 0xFFFFFF)
+                btn("btn-check", t("检查全部更新", "Check all"), ACCENT, 0xFFFFFF)
                     .on_click(cx.listener(|this, _, _, cx| this.resolve_all(cx))),
             )
-            .child(btn("btn-hist", "下载历史", 0xF2F4F8, TEXT).on_click(
+            .child(btn("btn-hist", t("下载历史", "History"), 0xF2F4F8, TEXT).on_click(
                 cx.listener(|this, _, _, cx| this.open_dialog(Dialog::History, cx)),
             ))
-            .child(btn("btn-settings", "设置", 0xF2F4F8, TEXT).on_click(
+            .child(btn("btn-settings", t("设置", "Settings"), 0xF2F4F8, TEXT).on_click(
                 cx.listener(|this, _, _, cx| this.open_dialog(Dialog::Settings, cx)),
             ))
-            .child(btn("btn-add", "+ 添加追踪", ACCENT, 0xFFFFFF).on_click(
+            .child(btn("btn-add", t("+ 添加追踪", "+ Add"), ACCENT, 0xFFFFFF).on_click(
                 cx.listener(|this, _, _, cx| {
                     this.open_dialog(Dialog::Add, cx);
                     // 打开就把焦点给输入框，粘贴不用先点一下。
@@ -1216,7 +1456,7 @@ impl App {
         div()
             .flex()
             .flex_col()
-            .w(px(272.))
+            .w(sp(272.))
             .h_full()
             .flex_shrink_0()
             .bg(rgb(SIDEBAR))
@@ -1233,14 +1473,14 @@ impl App {
                     .pb_2()
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(12.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(MUTED))
-                            .child("追踪列表"),
+                            .child(t("追踪列表", "TRACKED")),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(12.5))
                             .text_color(rgb(FAINT))
                             .child(if shown == self.tracks.len() {
                                 format!("{}", self.tracks.len())
@@ -1253,7 +1493,11 @@ impl App {
                 div()
                     .px_2()
                     .pb_2()
-                    .child(self.text_input(FieldId::Filter, "筛选名称或地址", cx)),
+                    .child(self.text_input(
+                        FieldId::Filter,
+                        t("筛选名称或地址", "Filter by name or URL"),
+                        cx,
+                    )),
             )
             .child(
                 div()
@@ -1270,12 +1514,15 @@ impl App {
                             div()
                                 .px_2()
                                 .py_2()
-                                .text_size(px(11.))
+                                .text_size(sp(12.5))
                                 .text_color(rgb(FAINT))
                                 .child(if needle.is_empty() {
-                                    "还没有追踪项，点右上角「添加追踪」"
+                                    t(
+                                        "还没有追踪项，点右上角「添加追踪」",
+                                        "Nothing tracked yet — try “+ Add” at the top right",
+                                    )
                                 } else {
-                                    "没有匹配的条目"
+                                    t("没有匹配的条目", "No matches")
                                 }),
                         )
                     })
@@ -1290,7 +1537,7 @@ impl App {
                                     .px_2()
                                     .pt_2()
                                     .pb_1()
-                                    .text_size(px(10.5))
+                                    .text_size(sp(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(FAINT))
                                     .child(group),
@@ -1313,7 +1560,7 @@ impl App {
                                     .cursor_pointer()
                                     .child(
                                         div()
-                                            .text_size(px(12.5))
+                                            .text_size(sp(14.))
                                             .font_weight(if is_sel {
                                                 FontWeight::SEMIBOLD
                                             } else {
@@ -1325,7 +1572,7 @@ impl App {
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(10.5))
+                                            .text_size(sp(12.))
                                             .text_color(rgb(color))
                                             .text_ellipsis()
                                             .child(sub),
@@ -1347,7 +1594,7 @@ impl App {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(div().text_color(rgb(FAINT)).child("左侧还没有追踪项"));
+                .child(div().text_color(rgb(FAINT)).child(t("左侧还没有追踪项", "Nothing tracked yet")));
         };
         let view = self.view();
         let sel = *self.candidate_sel.get(&track.id).unwrap_or(&0);
@@ -1412,22 +1659,22 @@ impl App {
                                             .gap_2()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.))
+                                                    .text_size(sp(12.5))
                                                     .text_color(rgb(FAINT))
-                                                    .child("更新说明"),
+                                                    .child(t("更新说明", "Release notes")),
                                             )
                                             .child(div().flex_1())
                                             // GPUI 0.2 没有文本选中，长文本得给个一键复制的出口。
                                             .child(
                                                 chip(
                                                     format!("copy-notes-{tid}"),
-                                                    "复制全文",
+                                                    t("复制全文", "Copy all"),
                                                     MUTED,
                                                     0xF2F4F8,
                                                 )
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     let c = copy.clone();
-                                                    this.copy(c, "更新说明", cx);
+                                                    this.copy(c, What::Notes, cx);
                                                 })),
                                             ),
                                     )
@@ -1474,54 +1721,78 @@ impl App {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(sp(13.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("下载队列"),
+                            .child(t("下载队列", "Downloads")),
                     )
-                    .child(badge(format!("{running} 进行中"), MUTED, 0xF2F4F8))
+                    // 全部结束时不再显示「0 进行中」——那一行只是噪音。
+                    .when(running > 0, |d| {
+                        d.child(badge(
+                            if i18n::is_en() {
+                                format!("{running} active")
+                            } else {
+                                format!("{running} 进行中")
+                            },
+                            MUTED,
+                            0xF2F4F8,
+                        ))
+                    })
                     .child(div().flex_1())
                     .child(
-                        btn("btn-clear", "清空已结束", 0xF2F4F8, TEXT)
+                        btn("btn-clear", t("清空已结束", "Clear finished"), 0xF2F4F8, TEXT)
                             .on_click(cx.listener(|this, _, _, cx| this.clear_finished(cx))),
                     ),
             )
-            .children(self.tasks.iter().take(3).map(|t| {
-                let id = t.spec.id.clone();
+            .children(self.tasks.iter().take(3).map(|task| {
+                let id = task.spec.id.clone();
                 let id2 = id.clone();
-                let pause_label = if t.status == TaskStatus::Running {
-                    "暂停"
-                } else if t.status == TaskStatus::Paused {
-                    "继续"
+                let pause_label = if task.status == TaskStatus::Running {
+                    crate::i18n::t("暂停", "Pause")
+                } else if task.status == TaskStatus::Paused {
+                    crate::i18n::t("继续", "Resume")
                 } else {
                     ""
                 };
                 let finished = matches!(
-                    t.status,
+                    task.status,
                     TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled
                 );
-                let detail = match t.status {
+                let detail = match task.status {
                     TaskStatus::Running => format!(
                         "{} / {} · {}",
-                        util::fmt_bytes(t.downloaded),
-                        util::fmt_bytes(t.total),
-                        util::fmt_speed(t.speed)
+                        util::fmt_bytes(task.downloaded),
+                        util::fmt_bytes(task.total),
+                        util::fmt_speed(task.speed)
                     ),
                     TaskStatus::Done => format!(
                         "{} · {}",
-                        util::fmt_bytes(t.downloaded),
-                        match t.sha_ok {
-                            Some(true) => "SHA-256 校验通过",
-                            Some(false) => "SHA-256 不一致",
-                            None => "无官方摘要",
+                        util::fmt_bytes(task.downloaded),
+                        match task.sha_ok {
+                            Some(true) => t("SHA-256 校验通过", "SHA-256 verified"),
+                            Some(false) => t("SHA-256 不一致", "SHA-256 mismatch"),
+                            None => t("无官方摘要", "no checksum"),
                         }
                     ),
-                    TaskStatus::Failed => t.error.clone().unwrap_or_else(|| "下载失败".into()),
-                    TaskStatus::Paused => format!(
-                        "已暂停 · {} / {}",
-                        util::fmt_bytes(t.downloaded),
-                        util::fmt_bytes(t.total)
-                    ),
+                    TaskStatus::Failed => task
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| t("下载失败", "download failed").into()),
+                    TaskStatus::Paused => {
+                        if i18n::is_en() {
+                            format!(
+                                "paused · {} / {}",
+                                util::fmt_bytes(task.downloaded),
+                                util::fmt_bytes(task.total)
+                            )
+                        } else {
+                            format!(
+                                "已暂停 · {} / {}",
+                                util::fmt_bytes(task.downloaded),
+                                util::fmt_bytes(task.total)
+                            )
+                        }
+                    }
                     _ => String::new(),
                 };
                 div()
@@ -1536,18 +1807,18 @@ impl App {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(11.5))
+                                    .text_size(sp(13.))
                                     .text_color(rgb(TEXT))
                                     .text_ellipsis()
                                     .min_w_0()
                                     .flex_1()
-                                    .child(format!("{} · {}", t.spec.app, t.spec.file)),
+                                    .child(format!("{} · {}", task.spec.app, task.spec.file)),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(status_color(t.status)))
-                                    .child(t.status.label()),
+                                    .text_size(sp(12.))
+                                    .text_color(rgb(status_color(task.status)))
+                                    .child(task.status.label()),
                             )
                             .when(!finished && !pause_label.is_empty(), |d| {
                                 d.child(
@@ -1557,7 +1828,7 @@ impl App {
                                         .py_1()
                                         .rounded_md()
                                         .bg(rgb(0xF2F4F8))
-                                        .text_size(px(10.5))
+                                        .text_size(sp(12.))
                                         .text_color(rgb(TEXT))
                                         .cursor_pointer()
                                         .child(pause_label)
@@ -1566,10 +1837,10 @@ impl App {
                                         })),
                                 )
                             })
-                            .when(t.status == TaskStatus::Done, |d| {
+                            .when(task.status == TaskStatus::Done, |d| {
                                 // 完成的给「打开」：直接交给系统默认程序，比让用户
                                 // 自己去找目录再双击快。
-                                let Some(path) = t.path.clone() else {
+                                let Some(path) = task.path.clone() else {
                                     return d;
                                 };
                                 let dir = std::path::Path::new(&path)
@@ -1583,10 +1854,10 @@ impl App {
                                         .py_1()
                                         .rounded_md()
                                         .bg(rgb(0xF2F4F8))
-                                        .text_size(px(10.5))
+                                        .text_size(sp(12.))
                                         .text_color(rgb(TEXT))
                                         .cursor_pointer()
-                                        .child("打开")
+                                        .child(t("打开", "Open"))
                                         .on_click(cx.listener(move |_, _, _, _| {
                                             let _ = open::that_detached(&p1);
                                         })),
@@ -1600,10 +1871,10 @@ impl App {
                                             .py_1()
                                             .rounded_md()
                                             .bg(rgb(0xF2F4F8))
-                                            .text_size(px(10.5))
+                                            .text_size(sp(12.))
                                             .text_color(rgb(TEXT))
                                             .cursor_pointer()
-                                            .child("目录")
+                                            .child(t("目录", "Folder"))
                                             .on_click(cx.listener(move |_, _, _, _| {
                                                 let _ = open::that_detached(&d2);
                                             })),
@@ -1611,9 +1882,9 @@ impl App {
                                 })
                             })
                             .when(
-                                matches!(t.status, TaskStatus::Failed | TaskStatus::Canceled),
+                                matches!(task.status, TaskStatus::Failed | TaskStatus::Canceled),
                                 |d| {
-                                    let id3 = t.spec.id.clone();
+                                    let id3 = task.spec.id.clone();
                                     d.child(
                                         div()
                                             .id(SharedString::from(format!("retry-{id3}")))
@@ -1621,10 +1892,10 @@ impl App {
                                             .py_1()
                                             .rounded_md()
                                             .bg(rgb(ACCENT_SOFT))
-                                            .text_size(px(10.5))
+                                            .text_size(sp(12.))
                                             .text_color(rgb(ACCENT))
                                             .cursor_pointer()
-                                            .child("重试")
+                                            .child(t("重试", "Retry"))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.retry_task(&id3, cx)
                                             })),
@@ -1639,10 +1910,10 @@ impl App {
                                         .py_1()
                                         .rounded_md()
                                         .bg(rgb(RED_SOFT))
-                                        .text_size(px(10.5))
+                                        .text_size(sp(12.))
                                         .text_color(rgb(RED))
                                         .cursor_pointer()
-                                        .child("取消")
+                                        .child(t("取消", "Cancel"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.cancel_task(&id2, cx)
                                         })),
@@ -1652,7 +1923,7 @@ impl App {
                     .when(!detail.is_empty(), |d| {
                         d.child(
                             div()
-                                .text_size(px(10.5))
+                                .text_size(sp(12.))
                                 .text_color(rgb(MUTED))
                                 .text_ellipsis()
                                 .child(detail),
@@ -1667,9 +1938,9 @@ impl App {
                             .child(
                                 div()
                                     .h_full()
-                                    .w(relative(t.frac()))
+                                    .w(relative(task.frac()))
                                     .rounded_full()
-                                    .bg(rgb(status_color(t.status))),
+                                    .bg(rgb(status_color(task.status))),
                             ),
                     )
             }))
@@ -1698,7 +1969,7 @@ impl App {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(19.))
+                            .text_size(sp(21.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
                             .child(track.name.clone()),
@@ -1711,16 +1982,20 @@ impl App {
                     .when_some(track.last_checked, |d, ts| {
                         d.child(
                             div()
-                                .text_size(px(10.5))
+                                .text_size(sp(12.))
                                 .text_color(rgb(FAINT))
-                                .child(format!("上次检查 {}", util::fmt_secs_ago(ts))),
+                                .child(if i18n::is_en() {
+                                    format!("checked {}", util::fmt_secs_ago(ts))
+                                } else {
+                                    format!("上次检查 {}", util::fmt_secs_ago(ts))
+                                }),
                         )
                     })
                     .when_some(track.last_error.clone(), |d, err| {
-                        d.child(badge("解析失败", RED, RED_SOFT))
+                        d.child(badge(t("解析失败", "Failed"), RED, RED_SOFT))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(sp(12.5))
                                     .text_color(rgb(RED))
                                     .text_ellipsis()
                                     .child(err),
@@ -1730,22 +2005,22 @@ impl App {
                     .when(self.resolving.contains(&track.id), |d| {
                         d.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(sp(12.5))
                                 .text_color(rgb(ACCENT))
-                                .child("检查中…"),
+                                .child(t("检查中…", "Checking…")),
                         )
                     })
                     .when_some(view.map(|r| r.version.clone()), |d, v| {
                         d.child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(sp(13.5))
                                 .text_color(rgb(MUTED))
                                 .child(format!("v{v}")),
                         )
                     })
                     .child({
                         let id = track.id.clone();
-                        btn("btn-recheck", "重新检查", 0xF2F4F8, TEXT).on_click(cx.listener(
+                        btn("btn-recheck", t("重新检查", "Refresh"), 0xF2F4F8, TEXT).on_click(cx.listener(
                             move |this, _, _, cx| this.resolve_one(&id, cx),
                         ))
                     })
@@ -1753,11 +2028,11 @@ impl App {
                         let id = track.id.clone();
                         if self.confirm_delete.as_deref() == Some(track.id.as_str()) {
                             // 二次确认放在原地：弹一个确认对话框对移除一行来说太重。
-                            btn("btn-del-yes", "确认删除", RED_SOFT, RED).on_click(cx.listener(
+                            btn("btn-del-yes", t("确认删除", "Confirm"), RED_SOFT, RED).on_click(cx.listener(
                                 move |this, _, _, cx| this.delete_track(&id, cx),
                             ))
                         } else {
-                            btn("btn-del", "删除", RED_SOFT, RED).on_click(cx.listener(
+                            btn("btn-del", t("删除", "Delete"), RED_SOFT, RED).on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     this.confirm_delete = Some(id.clone());
                                     cx.notify();
@@ -1778,7 +2053,7 @@ impl App {
                             .px_3()
                             .py_1()
                             .rounded_md()
-                            .text_size(px(12.))
+                            .text_size(sp(13.5))
                             .when(active, |d| {
                                 d.bg(rgb(CARD))
                                     .text_color(rgb(TEXT))
@@ -1812,16 +2087,20 @@ impl App {
             .border_color(rgb(BORDER))
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(sp(14.5))
                     .text_color(rgb(MUTED))
-                    .child("还没有解析结果"),
+                    .child(t("还没有解析结果", "No release resolved yet")),
             )
             .child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(sp(13.))
                     .text_color(rgb(FAINT))
                     .whitespace_normal()
-                    .child(format!("来源：{}", track.url)),
+                    .child(if i18n::is_en() {
+                        format!("Source: {}", track.url)
+                    } else {
+                        format!("来源：{}", track.url)
+                    }),
             )
             .into_any_element()
     }
@@ -1837,6 +2116,10 @@ impl App {
         let url = r.page_url.clone();
         let copy_url = r.page_url.clone();
         let ver_text = format!("v{}", r.version);
+        let published = r
+            .published
+            .clone()
+            .unwrap_or_else(|| t("未知", "unknown").to_string());
         div()
             .flex()
             .flex_col()
@@ -1864,67 +2147,76 @@ impl App {
                             .flex_1()
                             .child(
                                 div()
-                                    .text_size(px(26.))
+                                    .text_size(sp(28.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
                                     .child(ver_text.clone()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.5))
+                                    .text_size(sp(13.))
                                     .text_color(rgb(MUTED))
                                     .text_ellipsis()
-                                    .child(format!(
-                                        "{} · 发布于 {} · 来源 {}",
-                                        r.title,
-                                        r.published.clone().unwrap_or_else(|| "未知".into()),
-                                        r.provider
-                                    )),
+                                    .child(if i18n::is_en() {
+                                        format!(
+                                            "{} · published {} · {}",
+                                            r.title, published, r.provider
+                                        )
+                                    } else {
+                                        format!(
+                                            "{} · 发布于 {} · 来源 {}",
+                                            r.title, published, r.provider
+                                        )
+                                    }),
                             ),
                     )
                     .when(sel > 0, |d| {
                         d.child(badge(
                             if r.candidates.get(sel).map(|c| c.prerelease).unwrap_or(false) {
-                                "预览版"
+                                t("预览版", "Preview")
                             } else {
-                                "备选版本"
+                                t("备选版本", "Alternative")
                             },
                             ORANGE,
                             ORANGE_SOFT,
                         ))
                     })
                     .when(sel == 0 && track.has_update(), |d| {
-                        d.child(badge("发现新版本", ORANGE, ORANGE_SOFT))
+                        d.child(badge(t("发现新版本", "New version"), ORANGE, ORANGE_SOFT))
                     })
                     .child(
                         chip(
                             format!("copy-ver-{}", track.id),
-                            "复制版本",
+                            t("复制版本", "Copy version"),
                             MUTED,
                             0xF2F4F8,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let t = ver_text.clone();
-                            this.copy(t, "版本号", cx);
+                            this.copy(ver_text.clone(), What::Version, cx);
                         })),
                     )
                     .child(
                         chip(
                             format!("copy-page-{}", track.id),
-                            "复制链接",
+                            t("复制链接", "Copy link"),
                             MUTED,
                             0xF2F4F8,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let u = copy_url.clone();
-                            this.copy(u, "来源页链接", cx);
+                            this.copy(copy_url.clone(), What::PageLink, cx);
                         })),
                     )
                     .child(
-                        btn("btn-open-page", "打开来源页", 0xF2F4F8, TEXT).on_click(cx.listener(
+                        btn("btn-open-page", t("打开来源页", "Open page"), 0xF2F4F8, TEXT).on_click(cx.listener(
                             move |this, _, _, cx| {
                                 let _ = open::that_detached(&url);
-                                this.toast("已在浏览器打开来源页", cx);
+                                this.toast(
+                                    t(
+                                        "已在浏览器打开来源页",
+                                        "Opened the source page in your browser",
+                                    ),
+                                    cx,
+                                );
                             },
                         )),
                     ),
@@ -1949,7 +2241,7 @@ impl App {
                                 // 给确定宽度，否则 taffy 会用 min-content 宽度量高度：
                                 // 换行看着是对的，但卡片底部会多出一大块空白。
                                 .w(text_w)
-                                .text_size(px(12.5))
+                                .text_size(sp(14.))
                                 .text_color(rgb(TEXT))
                                 .whitespace_normal()
                                 .child(shown),
@@ -1960,10 +2252,17 @@ impl App {
                                 div().flex().flex_row().child(
                                     chip(
                                         format!("more-{tid}"),
-                                        format!(
-                                            "查看完整说明（共 {} 字）",
-                                            full.chars().count()
-                                        ),
+                                        if i18n::is_en() {
+                                            format!(
+                                                "Read the full notes ({} chars)",
+                                                full.chars().count()
+                                            )
+                                        } else {
+                                            format!(
+                                                "查看完整说明（共 {} 字）",
+                                                full.chars().count()
+                                            )
+                                        },
                                         ACCENT,
                                         ACCENT_SOFT,
                                     )
@@ -1979,9 +2278,9 @@ impl App {
             .children((r.candidates.len() > 1).then(|| {
                 let mut row = div().flex().flex_row().gap_2().items_center().child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(12.5))
                         .text_color(rgb(FAINT))
-                        .child("版本候选"),
+                        .child(t("版本候选", "Candidates")),
                 );
                 for (i, c) in r.candidates.iter().enumerate() {
                     let active = i == sel;
@@ -1992,7 +2291,7 @@ impl App {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .text_size(px(11.))
+                            .text_size(sp(12.5))
                             .when(c.prerelease, |d| d.text_color(rgb(ORANGE)))
                             .when(active, |d| d.bg(rgb(ACCENT_SOFT)))
                             .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))).cursor_pointer())
@@ -2019,18 +2318,36 @@ impl Render for App {
             // 关掉弹窗后焦点会悬空，快捷键随之失效，交还给根节点。
             self.root_focus.focus(window);
         }
+        // 窗口标题跟着语言走。`&mut Window` 只有绘制阶段拿得到，所以按需设一次，
+        // 而不是每帧都去打扰系统。
+        let lang = i18n::current();
+        if self.title_lang != Some(lang) {
+            window.set_window_title(&format!(
+                "App Monitor · {}",
+                t("软件追踪下载器", "release tracker")
+            ));
+            self.title_lang = Some(lang);
+        }
         // 正文文本按确定宽度换行：taffy 给自动宽度的换行文本量高度时用的是
         // min-content 宽度（最长单词的宽度），于是卡片下半截会多出几百像素空白。
-        // 这里按窗口宽度减去侧栏、内边距与边框算一个安全宽度传下去。
+        // 这里按窗口宽度减去侧栏、内边距与边框算一个安全宽度传下去；370 是侧栏
+        // 272 加上两侧内边距与卡片内边距，缩放时整块一起缩。
         let vw: f32 = window.viewport_size().width.into();
-        let text_width = px((vw - 370.).max(240.));
+        let vh: f32 = window.viewport_size().height.into();
+        let text_width = px((vw - 370. * scale()).max(240.));
+        // 英文界面用 Segoe UI 更地道；中文继续用雅黑，字形与字重都按它在调。
+        let font = if i18n::is_en() && cfg!(windows) {
+            "Segoe UI"
+        } else {
+            "Microsoft YaHei UI"
+        };
         let toast = self.toast.clone();
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(BG))
-            .font_family("Microsoft YaHei UI")
+            .font_family(font)
             .text_color(rgb(TEXT))
             .track_focus(&self.root_focus)
             // AM_LOG_MOUSE=1：把鼠标事件与缩放因子打到 stderr，排查「点了没反应」时用。
@@ -2084,7 +2401,7 @@ impl Render for App {
                         .py_1()
                         .rounded_md()
                         .bg(rgb(0xFFFFFF))
-                        .text_size(px(10.5))
+                        .text_size(sp(12.))
                         .text_color(rgb(TEXT))
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.85))
@@ -2112,15 +2429,22 @@ impl Render for App {
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_size(px(11.5))
+                                    .text_size(sp(13.))
                                     .text_color(rgb(TEXT))
-                                    .child(format!(
-                                        "{} 个数据文件未能读取，本次已改用默认内容",
-                                        self.issues.len()
-                                    )),
+                                    .child(if i18n::is_en() {
+                                        format!(
+                                            "{} data file(s) could not be read — this session fell back to defaults",
+                                            self.issues.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "{} 个数据文件未能读取，本次已改用默认内容",
+                                            self.issues.len()
+                                        )
+                                    }),
                             )
                             .child(
-                                small("issue-open", "打开数据目录").on_click(cx.listener(
+                                small("issue-open", t("打开数据目录", "Open data folder")).on_click(cx.listener(
                                     |_, _, _, _| {
                                         let dir = crate::store::data_dir();
                                         let _ = std::fs::create_dir_all(dir);
@@ -2129,7 +2453,7 @@ impl Render for App {
                                 )),
                             )
                             .child(
-                                small("issue-dismiss", "知道了").on_click(
+                                small("issue-dismiss", t("知道了", "Got it")).on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.issues.clear();
                                         cx.notify();
@@ -2139,23 +2463,46 @@ impl Render for App {
                     )
                     .children(self.issues.iter().map(|i| {
                         let kept = match &i.backup {
-                            Some(p) => format!(
-                                "原文件已备份为 {}",
-                                p.file_name()
+                            Some(p) => {
+                                let name = p
+                                    .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| p.to_string_lossy().to_string())
-                            ),
+                                    .unwrap_or_else(|| p.to_string_lossy().to_string());
+                                if i18n::is_en() {
+                                    format!("the original was kept as {name}")
+                                } else {
+                                    format!("原文件已备份为 {name}")
+                                }
+                            }
                             // 备份失败代表原文件仍在原地，程序这次不会覆盖它。
-                            None => "原文件保持不动".to_string(),
+                            None => t(
+                                "原文件保持不动",
+                                "the original file was left untouched",
+                            )
+                            .to_string(),
                         };
+                        let what = damage_text(&i.what);
                         div()
-                            .text_size(px(10.5))
+                            .text_size(sp(12.))
                             .text_color(rgb(MUTED))
                             .whitespace_normal()
-                            .child(format!(
-                                "· {} {}，本次使用{}。{}",
-                                i.file, i.what, i.fallback, kept
-                            ))
+                            .child(if i18n::is_en() {
+                                format!(
+                                    "· {} — {}, fell back to {}. {}",
+                                    i.file,
+                                    what,
+                                    fallback_text(i.fallback),
+                                    kept
+                                )
+                            } else {
+                                format!(
+                                    "· {} {}，本次使用{}。{}",
+                                    i.file,
+                                    what,
+                                    fallback_text(i.fallback),
+                                    kept
+                                )
+                            })
                     }))
             }))
             .child(self.top_bar(cx))
@@ -2169,7 +2516,8 @@ impl Render for App {
                     .child(self.main_panel(text_width, cx)),
             )
             .child(self.queue_panel(cx))
-            .child(self.dialog_layer(cx))
+            // toast 要排在弹窗**之前**：它是整行一条，画在弹窗后面时会把
+            // 弹窗底部（保存/取消）盖住。
             .children(toast.filter(|(_, at)| at.elapsed().as_secs() < 4).map(|(msg, _)| {
                 div()
                     .flex()
@@ -2177,10 +2525,11 @@ impl Render for App {
                     .px_5()
                     .py_2()
                     .bg(rgb(0x1F2937))
-                    .text_size(px(11.5))
+                    .text_size(sp(13.))
                     .text_color(rgb(0xFFFFFF))
                     .child(msg)
             }))
+            .child(self.dialog_layer(px((vh * 0.9).max(320.)), cx))
     }
 }
 
@@ -2188,18 +2537,59 @@ impl Render for App {
 // 小部件
 // ---------------------------------------------------------------------------
 
-fn track_status(t: &Track) -> (String, u32) {
-    if let Some(err) = &t.last_error {
-        let short: String = err.chars().take(18).collect();
-        return (format!("解析失败 · {}", short), RED);
+/// 损坏文件横幅里的「原因」。中文直接用 `Display` —— 和命令行 `--check` 是
+/// 同一套措辞，不用维护两份；英文在这里给。
+fn damage_text(d: &crate::store::Damage) -> String {
+    use crate::store::Damage;
+    if !i18n::is_en() {
+        return d.to_string();
     }
-    if let Some(r) = &t.release {
-        if t.has_update() {
-            return (format!("↑ 新版本 {}", r.version), ORANGE);
+    match d {
+        Damage::Io(e) => format!("it could not be read: {e}"),
+        Damage::Empty => "the file was empty, most likely an interrupted write".to_string(),
+        Damage::BadJson(e) => format!("its content is not valid JSON ({e})"),
+    }
+}
+
+/// 出问题后这次会话改用了什么。
+fn fallback_text(f: crate::store::Fallback) -> String {
+    use crate::store::Fallback;
+    if !i18n::is_en() {
+        return f.to_string();
+    }
+    match f {
+        Fallback::DefaultConfig => "default settings".to_string(),
+        Fallback::DefaultTracks => "the built-in list".to_string(),
+        Fallback::EmptyHistory => "an empty history".to_string(),
+    }
+}
+
+fn track_status(track: &Track) -> (String, u32) {
+    if let Some(err) = &track.last_error {
+        let short: String = err.chars().take(18).collect();
+        return (
+            if i18n::is_en() {
+                format!("failed · {short}")
+            } else {
+                format!("解析失败 · {short}")
+            },
+            RED,
+        );
+    }
+    if let Some(r) = &track.release {
+        if track.has_update() {
+            return (
+                if i18n::is_en() {
+                    format!("↑ new {}", r.version)
+                } else {
+                    format!("↑ 新版本 {}", r.version)
+                },
+                ORANGE,
+            );
         }
         return (format!("v{}", r.version), GREEN);
     }
-    ("等待首次检查".to_string(), FAINT)
+    (t("等待首次检查", "waiting for first check").to_string(), FAINT)
 }
 
 fn badge(text: impl Into<SharedString>, fg: u32, bg: u32) -> Div {
@@ -2208,7 +2598,7 @@ fn badge(text: impl Into<SharedString>, fg: u32, bg: u32) -> Div {
         .py_1()
         .rounded_md()
         .bg(rgb(bg))
-        .text_size(px(10.5))
+        .text_size(sp(12.))
         .text_color(rgb(fg))
         .child(text.into())
 }
@@ -2255,14 +2645,14 @@ fn toggle(
         .cursor_pointer()
         .child(
             div()
-                .w(px(11.))
-                .h(px(11.))
+                .w(sp(12.))
+                .h(sp(12.))
                 .rounded_sm()
                 .bg(rgb(if on { ACCENT } else { 0xFFFFFF }))
                 .border_1()
                 .border_color(rgb(if on { ACCENT } else { BORDER })),
         )
-        .child(div().text_size(px(11.)).text_color(rgb(TEXT)).child(text))
+        .child(div().text_size(sp(12.5)).text_color(rgb(TEXT)).child(text))
         .on_click(cx.listener(move |this, _, _, cx| {
             apply(this);
             cx.notify();
@@ -2277,7 +2667,7 @@ fn btn(id: &'static str, text: &'static str, bg: u32, fg: u32) -> Stateful<Div> 
         .py_2()
         .rounded_md()
         .bg(rgb(bg))
-        .text_size(px(11.5))
+        .text_size(sp(13.))
         .text_color(rgb(fg))
         .hover(|s| s.opacity(0.88))
         .cursor_pointer()
@@ -2309,7 +2699,7 @@ fn chip(
         .py_1()
         .rounded_md()
         .bg(rgb(bg))
-        .text_size(px(10.5))
+        .text_size(sp(12.))
         .text_color(rgb(fg))
         .hover(|s| s.opacity(0.85))
         .cursor_pointer()
@@ -2346,20 +2736,20 @@ impl App {
             format!("{}{}", mask(before), mask(after))
         };
         let color = if empty && !focused { FAINT } else { TEXT };
-        let height = if tf.multiline { 78.0 } else { 30.0 };
+        let height = if tf.multiline { sp(78.) } else { sp(30.) };
         let focus = tf.focus.clone();
 
         div()
             .id(SharedString::from(format!("input-{field:?}")))
             .w_full()
-            .h(px(height))
+            .h(height)
             .px_2()
             .py_2()
             .rounded_md()
             .bg(rgb(0xFFFFFF))
             .border_1()
             .border_color(rgb(if focused { ACCENT } else { BORDER }))
-            .text_size(px(11.5))
+            .text_size(sp(13.))
             .text_color(rgb(color))
             .whitespace_normal()
             .overflow_hidden()
@@ -2379,6 +2769,7 @@ impl App {
         &self,
         title: &'static str,
         width: f32,
+        max_h: Pixels,
         body: AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2396,7 +2787,12 @@ impl App {
                     .flex()
                     .flex_col()
                     .w(px(width))
-                    .max_h(px(600.))
+                    // 高度跟着窗口走而不是钉死 600：设置项多了一屏放不下，
+                    // 配合下面的滚动条才不会把底部的「保存」裁掉。
+                    .max_h(max_h)
+                    // flex 子项默认 min-height:auto，内容高过 max_h 时它会顶着
+                    // 卡片继续长高（max-height 形同虚设），必须显式允许它缩小。
+                    .min_h_0()
                     .rounded_lg()
                     .bg(rgb(CARD))
                     .border_1()
@@ -2414,7 +2810,7 @@ impl App {
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_size(px(13.5))
+                                    .text_size(sp(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
                                     .child(title),
@@ -2425,7 +2821,7 @@ impl App {
                                     .px_2()
                                     .py_1()
                                     .rounded_md()
-                                    .text_size(px(11.5))
+                                    .text_size(sp(13.))
                                     .text_color(rgb(MUTED))
                                     .hover(|s| s.bg(rgb(HOVER)))
                                     .cursor_pointer()
@@ -2433,14 +2829,31 @@ impl App {
                                     .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
                             ),
                     )
-                    .child(body),
+                    .child(
+                        div()
+                            .id("modal-body")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            // 卡片的 max_h 只把外框裁短，里面的 flex 布局拿不到
+                            // 「有界的高度」，内容会顶出去被 overflow_hidden 切掉。
+                            // 给内容自己再来一次限高，滚动条才会真的出现。
+                            .max_h(max_h - sp(56.))
+                            .overflow_y_scroll()
+                            .child(body),
+                    ),
             )
             .into_any_element()
     }
 
-    fn add_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
-        let hint = "每行一个地址，支持 GitHub 仓库 / releases 页、软件站页面、系统镜像页；\
-                    也可以直接贴一段含网址的文字，会自动挑出其中的链接。";
+    fn add_dialog(&self, max_h: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let hint = t(
+            "每行一个地址，支持 GitHub 仓库 / releases 页、软件站页面、系统镜像页；\
+             也可以直接贴一段含网址的文字，会自动挑出其中的链接。",
+            "One URL per line — GitHub repos and release pages, download-site pages and OS \
+             image pages all work. Pasting a paragraph that contains links works too.",
+        );
         let body = div()
             .flex()
             .flex_col()
@@ -2448,7 +2861,7 @@ impl App {
             .p_5()
             .child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(sp(13.))
                     .text_color(rgb(MUTED))
                     .whitespace_normal()
                     .child(hint),
@@ -2465,13 +2878,23 @@ impl App {
                         .bg(rgb(ORANGE_SOFT))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(sp(12.5))
                                 .text_color(rgb(ORANGE))
-                                .child(format!("有 {} 行没能识别（已忽略）：", self.add_skipped.len())),
+                                .child(if i18n::is_en() {
+                                    format!(
+                                        "{} line(s) could not be parsed (ignored):",
+                                        self.add_skipped.len()
+                                    )
+                                } else {
+                                    format!(
+                                        "有 {} 行没能识别（已忽略）：",
+                                        self.add_skipped.len()
+                                    )
+                                }),
                         )
                         .children(self.add_skipped.iter().take(4).map(|s| {
                             div()
-                                .text_size(px(10.5))
+                                .text_size(sp(12.))
                                 .text_color(rgb(MUTED))
                                 .text_ellipsis()
                                 .child(s.clone())
@@ -2485,28 +2908,34 @@ impl App {
                     .items_center()
                     .gap_2()
                     .child(
-                        btn("btn-add-ok", "解析并添加", ACCENT, 0xFFFFFF)
+                        btn("btn-add-ok", t("解析并添加", "Add"), ACCENT, 0xFFFFFF)
                             .on_click(cx.listener(|this, _, _, cx| this.submit_add(cx))),
                     )
                     .child(
-                        btn("btn-add-cancel", "取消", 0xF2F4F8, TEXT)
+                        btn("btn-add-cancel", t("取消", "Cancel"), 0xF2F4F8, TEXT)
                             .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
                     )
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(sp(12.))
                             .text_color(rgb(FAINT))
-                            .child("Ctrl+V 粘贴 · Esc 关闭"),
+                            .child(t("Ctrl+V 粘贴 · Esc 关闭", "Ctrl+V to paste · Esc to close")),
                     ),
             );
-        self.modal_shell("添加追踪项", 620., body.into_any_element(), cx)
+        self.modal_shell(
+            t("添加追踪项", "Add tracked items"),
+            620.,
+            max_h,
+            body.into_any_element(),
+            cx,
+        )
     }
 
-    fn settings_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn settings_dialog(&self, max_h: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let label = |text: &'static str| {
             div()
-                .text_size(px(11.))
+                .text_size(sp(12.5))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(MUTED))
                 .child(text)
@@ -2519,7 +2948,7 @@ impl App {
                 .py_1()
                 .rounded_md()
                 .bg(rgb(0xF2F4F8))
-                .text_size(px(13.))
+                .text_size(sp(14.5))
                 .text_color(rgb(TEXT))
                 .hover(|s| s.bg(rgb(HOVER)))
                 .cursor_pointer()
@@ -2527,17 +2956,39 @@ impl App {
         };
         let conc = self.cfg.max_concurrent;
         let interval = self.cfg.check_interval_min;
+        // 显示生效值而不是配置值：`AM_UI_SCALE` 这类临时覆盖下两者会不一致。
+        let ui_scale = scale();
+        // 语言按钮：点了立刻生效，不像别的设置那样要按「保存」—— 换错语言之后
+        // 弹窗里的字已经变了，得能马上切回来。
+        let lang_btn = |id: &'static str, want: i18n::Lang, cx: &mut Context<Self>| {
+            let active = i18n::current() == want;
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(if active { ACCENT_SOFT } else { 0xF2F4F8 }))
+                .text_size(sp(13.))
+                .text_color(rgb(if active { ACCENT } else { TEXT }))
+                .cursor_pointer()
+                .child(want.label())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_lang(want, cx)))
+        };
 
         let dir_row = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .child(div().flex_1().child(self.text_input(FieldId::DownloadDir, "下载根目录", cx)))
-            .child(btn("btn-pick-dir", "浏览…", 0xF2F4F8, TEXT).on_click(cx.listener(
+            .child(div().flex_1().child(self.text_input(
+                FieldId::DownloadDir,
+                t("下载根目录", "Download folder"),
+                cx,
+            )))
+            .child(btn("btn-pick-dir", t("浏览…", "Browse…"), 0xF2F4F8, TEXT).on_click(cx.listener(
                 |this, _, _, cx| {
                     if let Some(dir) = rfd::FileDialog::new()
-                        .set_title("选择下载根目录")
+                        .set_title(t("选择下载根目录", "Choose the download folder"))
                         .pick_folder()
                     {
                         this.set_dir.set(dir.to_string_lossy().to_string());
@@ -2551,13 +3002,27 @@ impl App {
             .flex_col()
             .gap_3()
             .p_5()
-            .child(label("下载目录"))
+            .child(label(t("下载目录", "Download folder")))
             .child(dir_row)
-            .child(label("GitHub Token（可选，提高 API 限额）"))
-            .child(self.text_input(FieldId::Token, "ghp_…（留空则用匿名访问）", cx))
-            .child(label("代理（可选，例如 http://127.0.0.1:7890）"))
-            .child(self.text_input(FieldId::Proxy, "留空表示直连", cx))
-            .child(label("同时下载数"))
+            .child(label(t(
+                "GitHub Token（可选，提高 API 限额）",
+                "GitHub token (optional — raises the API rate limit)",
+            )))
+            .child(self.text_input(
+                FieldId::Token,
+                t("ghp_…（留空则用匿名访问）", "ghp_… (empty = anonymous)"),
+                cx,
+            ))
+            .child(label(t(
+                "代理（可选，例如 http://127.0.0.1:7890）",
+                "Proxy (optional, e.g. http://127.0.0.1:7890)",
+            )))
+            .child(self.text_input(
+                FieldId::Proxy,
+                t("留空表示直连", "empty = direct connection"),
+                cx,
+            ))
+            .child(label(t("同时下载数", "Concurrent downloads")))
             .child(
                 div()
                     .flex()
@@ -2573,8 +3038,8 @@ impl App {
                     )))
                     .child(
                         div()
-                            .min_w(px(48.))
-                            .text_size(px(11.5))
+                            .min_w(sp(48.))
+                            .text_size(sp(13.))
                             .text_color(rgb(TEXT))
                             .child(format!("{conc}")),
                     )
@@ -2585,7 +3050,7 @@ impl App {
                         },
                     ))),
             )
-            .child(label("自动检查间隔（0 = 关闭）"))
+            .child(label(t("自动检查间隔（0 = 关闭）", "Auto-check interval (0 = off)")))
             .child(
                 div()
                     .flex()
@@ -2601,11 +3066,13 @@ impl App {
                     )))
                     .child(
                         div()
-                            .min_w(px(78.))
-                            .text_size(px(11.5))
+                            .min_w(sp(78.))
+                            .text_size(sp(13.))
                             .text_color(rgb(TEXT))
                             .child(if interval == 0 {
-                                "已关闭".to_string()
+                                t("已关闭", "off").to_string()
+                            } else if i18n::is_en() {
+                                format!("{interval} min")
                             } else {
                                 format!("{interval} 分钟")
                             }),
@@ -2624,18 +3091,61 @@ impl App {
                     .gap_2()
                     .child(toggle(
                         "toggle-auto",
-                        "启动时自动检查",
+                        t("启动时自动检查", "Check on startup"),
                         self.cfg.auto_check_on_start,
                         cx,
                         |this| this.cfg.auto_check_on_start = !this.cfg.auto_check_on_start,
                     ))
                     .child(toggle(
                         "toggle-os",
-                        "优先当前系统",
+                        t("优先当前系统", "Prefer this OS"),
                         self.cfg.prefer_current_os,
                         cx,
                         |this| this.cfg.prefer_current_os = !this.cfg.prefer_current_os,
                     )),
+            )
+            .child(label(t("界面语言", "Language")))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(lang_btn("btn-lang-zh", i18n::Lang::Zh, cx))
+                    .child(lang_btn("btn-lang-en", i18n::Lang::En, cx)),
+            )
+            .child(label(t(
+                "界面缩放（高 DPI 屏上嫌字小就调大）",
+                "UI scale (raise it if the text feels small)",
+            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(step_btn("btn-scale-less", "−").on_click(cx.listener(
+                        |this, _, _, cx| this.nudge_scale(-SCALE_STEP, cx),
+                    )))
+                    .child(
+                        div()
+                            .min_w(sp(78.))
+                            .text_size(sp(13.))
+                            .text_color(rgb(TEXT))
+                            .child(format!("{}%", (ui_scale * 100.0).round() as i32)),
+                    )
+                    .child(step_btn("btn-scale-more", "+").on_click(cx.listener(
+                        |this, _, _, cx| this.nudge_scale(SCALE_STEP, cx),
+                    )))
+                    .child(
+                        div()
+                            .text_size(sp(12.))
+                            .text_color(rgb(FAINT))
+                            .child(t(
+                                "只影响界面，不影响下载内容",
+                                "affects the UI only",
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -2644,29 +3154,43 @@ impl App {
                     .items_center()
                     .gap_2()
                     .child(
-                        btn("btn-set-ok", "保存", ACCENT, 0xFFFFFF)
+                        btn("btn-set-ok", t("保存", "Save"), ACCENT, 0xFFFFFF)
                             .on_click(cx.listener(|this, _, _, cx| this.submit_settings(cx))),
                     )
                     .child(
-                        btn("btn-set-cancel", "取消", 0xF2F4F8, TEXT)
+                        btn("btn-set-cancel", t("取消", "Cancel"), 0xF2F4F8, TEXT)
                             .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
                     )
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(sp(12.))
                             .text_color(rgb(FAINT))
-                            .child(format!(
-                                "v{} · 数据目录 {}",
-                                env!("CARGO_PKG_VERSION"),
-                                crate::store::data_dir().display()
-                            )),
+                            .child(if i18n::is_en() {
+                                format!(
+                                    "v{} · data folder {}",
+                                    env!("CARGO_PKG_VERSION"),
+                                    crate::store::data_dir().display()
+                                )
+                            } else {
+                                format!(
+                                    "v{} · 数据目录 {}",
+                                    env!("CARGO_PKG_VERSION"),
+                                    crate::store::data_dir().display()
+                                )
+                            }),
                     ),
             );
-        self.modal_shell("设置", 640., body.into_any_element(), cx)
+        self.modal_shell(
+            t("设置", "Settings"),
+            640.,
+            max_h,
+            body.into_any_element(),
+            cx,
+        )
     }
 
-    fn history_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn history_dialog(&self, max_h: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let rows: Vec<DownloadRecord> = self.history.iter().take(80).cloned().collect();
         let body = div()
             .flex()
@@ -2676,9 +3200,9 @@ impl App {
             .when(rows.is_empty(), |d| {
                 d.child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(13.))
                         .text_color(rgb(FAINT))
-                        .child("还没有下载记录"),
+                        .child(t("还没有下载记录", "No downloads yet")),
                 )
             })
             .children(rows.iter().map(|r| {
@@ -2704,21 +3228,21 @@ impl App {
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_size(px(11.5))
+                                    .text_size(sp(13.))
                                     .text_color(rgb(TEXT))
                                     .text_ellipsis()
                                     .child(format!("{} · {}", r.app, r.file)),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(sp(12.))
                                     .text_color(rgb(color))
-                                    .child(r.status.clone()),
+                                    .child(status_text(&r.status)),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(sp(12.))
                             .text_color(rgb(MUTED))
                             .text_ellipsis()
                             .child(format!(
@@ -2733,8 +3257,8 @@ impl App {
                                     format!(" · {}", r.path)
                                 },
                                 match r.sha_ok {
-                                    Some(true) => " · SHA-256 通过",
-                                    Some(false) => " · SHA-256 不一致",
+                                    Some(true) => t(" · SHA-256 通过", " · SHA-256 ok"),
+                                    Some(false) => t(" · SHA-256 不一致", " · SHA-256 mismatch"),
                                     None => "",
                                 }
                             )),
@@ -2742,7 +3266,7 @@ impl App {
                     .when_some(r.error.clone(), |d, e| {
                         d.child(
                             div()
-                                .text_size(px(10.5))
+                                .text_size(sp(12.))
                                 .text_color(rgb(RED))
                                 .text_ellipsis()
                                 .child(e),
@@ -2756,30 +3280,48 @@ impl App {
                     .gap_2
                     ()
                     .child(
-                        btn("btn-hist-clear", "清空历史", RED_SOFT, RED).on_click(cx.listener(
+                        btn("btn-hist-clear", t("清空历史", "Clear history"), RED_SOFT, RED)
+                            .on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.history.clear();
                                 crate::store::write_history(&this.history);
-                                this.toast("下载历史已清空", cx);
+                                this.toast(t("下载历史已清空", "Download history cleared"), cx);
                             },
                         )),
                     )
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(sp(12.))
                             .text_color(rgb(FAINT))
-                            .child(format!("共 {} 条", self.history.len())),
+                            .child(if i18n::is_en() {
+                                format!(
+                                    "{} record{}",
+                                    self.history.len(),
+                                    if self.history.len() == 1 { "" } else { "s" }
+                                )
+                            } else {
+                                format!("共 {} 条", self.history.len())
+                            }),
                     ),
             );
-        self.modal_shell("下载历史", 720., body.into_any_element(), cx)
+        self.modal_shell(
+            t("下载历史", "Download history"),
+            720.,
+            max_h,
+            body.into_any_element(),
+            cx,
+        )
     }
 
-    fn dialog_layer(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// `max_h` 由 `render` 按窗口高度算好传进来：`max_h(relative(..))` 在
+    /// 绝对定位的遮罩里没能约束住卡片（内容照旧把卡片顶高，底部的按钮被
+    /// 推到窗口外），换成确定的像素值最省事。
+    fn dialog_layer(&self, max_h: Pixels, cx: &mut Context<Self>) -> AnyElement {
         match self.dialog {
-            Some(Dialog::Add) => self.add_dialog(cx),
-            Some(Dialog::Settings) => self.settings_dialog(cx),
-            Some(Dialog::History) => self.history_dialog(cx),
+            Some(Dialog::Add) => self.add_dialog(max_h, cx),
+            Some(Dialog::Settings) => self.settings_dialog(max_h, cx),
+            Some(Dialog::History) => self.history_dialog(max_h, cx),
             None => div().into_any_element(),
         }
     }
@@ -2814,24 +3356,31 @@ impl App {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(sp(14.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("附件"),
+                            .child(t("附件", "Files")),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(12.5))
                             .text_color(rgb(FAINT))
-                            .child(format!("{} 个", assets.len())),
+                            .child(if i18n::is_en() {
+                                format!("{} total", assets.len())
+                            } else {
+                                format!("{} 个", assets.len())
+                            }),
                     ),
             )
             .when(assets.is_empty(), |d| {
                 d.child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(13.))
                         .text_color(rgb(FAINT))
-                        .child("该来源没有列出可下载文件"),
+                        .child(t(
+                            "该来源没有列出可下载文件",
+                            "This source lists no downloadable files",
+                        )),
                 )
             })
             .children(assets.into_iter().map(|a| {
@@ -2866,21 +3415,21 @@ impl App {
                             .flex_1()
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(sp(13.5))
                                     .text_color(rgb(TEXT))
                                     .text_ellipsis()
                                     .child(a.name.clone()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(sp(12.))
                                     .text_color(rgb(FAINT))
                                     .text_ellipsis()
                                     .child(format!(
                                         "{}{}{}",
                                         a.size
                                             .map(util::fmt_bytes)
-                                            .unwrap_or_else(|| "大小未知".into()),
+                                            .unwrap_or_else(|| t("大小未知", "size unknown").into()),
                                         if a.note.is_empty() {
                                             String::new()
                                         } else {
@@ -2893,7 +3442,11 @@ impl App {
                     .child(
                         chip(
                             format!("kind-{}-{}", track_id, a.name),
-                            if direct { "直链" } else { "页面" },
+                            if direct {
+                                t("直链", "direct")
+                            } else {
+                                t("页面", "page")
+                            },
                             if direct { GREEN } else { MUTED },
                             if direct { GREEN_SOFT } else { 0xF2F4F8 },
                         )
@@ -2904,13 +3457,12 @@ impl App {
                     .child(
                         chip(
                             format!("copy-{}-{}", track_id, a.name),
-                            "复制",
+                            t("复制", "Copy"),
                             MUTED,
                             0xF2F4F8,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let (t, n) = (copy_text.clone(), copy_name.clone());
-                            this.copy(t, &format!("「{n}」的链接"), cx);
+                            this.copy(copy_text.clone(), What::AssetLink(copy_name.clone()), cx);
                         })),
                     )
                     .child(
@@ -2921,11 +3473,15 @@ impl App {
                             .py_1()
                             .rounded_md()
                             .bg(rgb(if direct { ACCENT } else { 0xF2F4F8 }))
-                            .text_size(px(11.))
+                            .text_size(sp(12.5))
                             .text_color(rgb(if direct { 0xFFFFFF } else { TEXT }))
                             .hover(|s| s.opacity(0.88))
                             .cursor_pointer()
-                            .child(if direct { "下载" } else { "打开" })
+                            .child(if direct {
+                                t("下载", "Download")
+                            } else {
+                                t("打开", "Open")
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.start_asset(&tid, &ver, &asset_for_click, &pg, cx);
                             })),
@@ -2948,8 +3504,8 @@ fn notes_card(notes: &str, text_w: Pixels) -> impl IntoElement {
         .child(
             div()
                 .w(text_w)
-                .text_size(px(12.5))
-                .line_height(px(20.))
+                .text_size(sp(14.))
+                .line_height(sp(22.))
                 .text_color(rgb(TEXT))
                 .whitespace_normal()
                 .child(notes.to_string()),
@@ -2982,14 +3538,14 @@ fn history_card(hist: &[crate::model::VersionEntry]) -> impl IntoElement {
                         .gap_2()
                         .child(
                             div()
-                                .text_size(px(12.5))
+                                .text_size(sp(14.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT))
                                 .child(h.version.clone()),
                         )
                         .child(
                             div()
-                                .text_size(px(10.5))
+                                .text_size(sp(12.))
                                 .text_color(rgb(FAINT))
                                 .child(h.date.clone().unwrap_or_default()),
                         ),
@@ -2997,7 +3553,7 @@ fn history_card(hist: &[crate::model::VersionEntry]) -> impl IntoElement {
                 .when(!h.title.trim().is_empty(), |d| {
                     d.child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(sp(13.))
                             .text_color(rgb(MUTED))
                             .text_ellipsis()
                             .child(h.title.clone()),
@@ -3023,7 +3579,8 @@ pub fn run() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("App Monitor · 软件追踪下载器".into()),
+                    // 真正的标题在 `render` 里按语言设，这里先给个不带语言的字。
+                    title: Some("App Monitor".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

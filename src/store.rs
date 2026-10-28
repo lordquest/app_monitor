@@ -17,13 +17,55 @@ use crate::util;
 pub struct LoadIssue {
     /// File name inside the data directory, e.g. `tracks.json`.
     pub file: &'static str,
-    /// What went wrong, already phrased for the banner.
-    pub what: String,
+    /// What went wrong. 用枚举而不是一句现成的话：`Store::load()` 跑在语言设置
+    /// 读出来之前，这里攒下的中文会一直留在英文界面上。措辞交给界面层。
+    pub what: Damage,
     /// What the session is using instead.
-    pub fallback: &'static str,
+    pub fallback: Fallback,
     /// Where the preserved copy went; `None` when it could not be preserved, in
     /// which case the original is left untouched and not rebuilt.
     pub backup: Option<PathBuf>,
+}
+
+/// Why a file on disk could not be used.
+#[derive(Debug)]
+pub enum Damage {
+    /// Opening or reading failed (permissions, locked by another process …).
+    Io(String),
+    /// Zero bytes: what a write interrupted mid-flight leaves behind.
+    Empty,
+    /// Not valid JSON (truncated, hand-edited, wrong encoding …).
+    BadJson(String),
+}
+
+/// What the session fell back to after quarantining a damaged file.
+#[derive(Clone, Copy, Debug)]
+pub enum Fallback {
+    DefaultConfig,
+    DefaultTracks,
+    EmptyHistory,
+}
+
+// 命令行的 `--check` 直接把这两样打进终端，所以给一套中文的 Display；
+// 界面按当前语言另外措辞（见 ui::damage_text），两边不会各写一份中文。
+impl std::fmt::Display for Damage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Damage::Io(e) => write!(f, "读取失败：{e}"),
+            Damage::Empty => f.write_str("文件是空的，可能是上次写入被中断"),
+            Damage::BadJson(e) => write!(f, "内容不是合法的 JSON（{e}）"),
+        }
+    }
+}
+
+impl std::fmt::Display for Fallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Fallback::DefaultConfig => "默认设置",
+            Fallback::DefaultTracks => "内置的默认追踪清单",
+            Fallback::EmptyHistory => "空历史",
+        })
+    }
 }
 
 pub fn data_dir() -> &'static PathBuf {
@@ -48,10 +90,10 @@ pub fn data_dir() -> &'static PathBuf {
     })
 }
 
-/// Why a file could not be used: the reason, and where the preserved copy went.
-type Damage = (String, Option<PathBuf>);
+/// Why a file could not be used, and where the preserved copy went.
+type Damaged = (Damage, Option<PathBuf>);
 
-fn read_json<T: serde::de::DeserializeOwned>(name: &'static str) -> Result<Option<T>, Damage> {
+fn read_json<T: serde::de::DeserializeOwned>(name: &'static str) -> Result<Option<T>, Damaged> {
     load_file(&data_dir().join(name), name)
 }
 
@@ -59,26 +101,26 @@ fn read_json<T: serde::de::DeserializeOwned>(name: &'static str) -> Result<Optio
 ///
 /// `name` only feeds the backup filename; the path is explicit so tests can point
 /// at a scratch directory instead of the real portable data folder.
-fn load_file<T: serde::de::DeserializeOwned>(path: &Path, name: &str) -> Result<Option<T>, Damage> {
+fn load_file<T: serde::de::DeserializeOwned>(path: &Path, name: &str) -> Result<Option<T>, Damaged> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         // No file is a normal state — first launch, or the user deleted it to start
         // over. Only *unreadable* content is an issue worth reporting.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err((format!("读取失败：{e}"), None)),
+        Err(e) => return Err((Damage::Io(e.to_string()), None)),
     };
     if text.trim().is_empty() {
         // A zero-byte file is what a crash during `write_json` leaves behind (the
         // rename is atomic, but a truncated write before it is not). Treat it as
         // damaged rather than as "no data": same quarantine, same message.
         let backup = quarantine(path, name);
-        return Err(("文件是空的，可能是上次写入被中断".into(), backup));
+        return Err((Damage::Empty, backup));
     }
     match serde_json::from_str(&text) {
         Ok(v) => Ok(Some(v)),
         Err(e) => {
             let backup = quarantine(path, name);
-            Err((format!("内容不是合法的 JSON（{e}）"), backup))
+            Err((Damage::BadJson(e.to_string()), backup))
         }
     }
 }
@@ -176,7 +218,7 @@ impl Store {
                 issues.push(LoadIssue {
                     file: "config.json",
                     what,
-                    fallback: "默认设置",
+                    fallback: Fallback::DefaultConfig,
                     backup,
                 });
                 (Config::default(), safe)
@@ -191,7 +233,7 @@ impl Store {
                 issues.push(LoadIssue {
                     file: "tracks.json",
                     what,
-                    fallback: "内置的默认追踪清单",
+                    fallback: Fallback::DefaultTracks,
                     backup,
                 });
                 (parse::parse_input(parse::DEFAULT_INPUT).tracks, safe)
@@ -204,7 +246,7 @@ impl Store {
                 issues.push(LoadIssue {
                     file: "history.json",
                     what,
-                    fallback: "空历史",
+                    fallback: Fallback::EmptyHistory,
                     backup,
                 });
                 Vec::new()
@@ -270,9 +312,10 @@ mod tests {
         let original = "[{\"id\":\"keep-me\",,,}]";
         std::fs::write(&path, original).unwrap();
 
-        let err = load_file::<serde_json::Value>(&path, "tracks.json").unwrap_err();
-        assert!(err.0.contains("不是合法的 JSON"), "原因要说清楚: {}", err.0);
-        let backup = err.1.expect("必须留下备份");
+        let (what, backup) = load_file::<serde_json::Value>(&path, "tracks.json").unwrap_err();
+        // 断言枚举而不是文案：serde 的具体报错里带行列号，字符串一改测试就碎。
+        assert!(matches!(what, Damage::BadJson(_)), "要指出是 JSON 语法坏了");
+        let backup = backup.expect("必须留下备份");
         assert!(!path.exists(), "原路径要腾空，避免下次保存覆盖");
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
         assert!(backup.to_string_lossy().ends_with(".corrupt"));
@@ -284,9 +327,9 @@ mod tests {
         let dir = scratch("empty");
         let path = dir.join("config.json");
         std::fs::write(&path, b"").unwrap();
-        let err = load_file::<serde_json::Value>(&path, "config.json").unwrap_err();
-        assert!(err.0.contains("空的"), "{}", err.0);
-        assert!(err.1.is_some(), "零字节文件也要留档，方便查是谁写坏的");
+        let (what, backup) = load_file::<serde_json::Value>(&path, "config.json").unwrap_err();
+        assert!(matches!(what, Damage::Empty), "零字节要认成「写到一半断了」");
+        assert!(backup.is_some(), "零字节文件也要留档，方便查是谁写坏的");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
