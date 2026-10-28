@@ -202,6 +202,7 @@ app-monitor --download-test    # 真下载第一个 GitHub 项的 Windows 附件
 app-monitor --download Netcatty --asset win-x64.zip   # 下载指定条目的指定附件（大文件/续传问题复现用）
 app-monitor --select nyaterm              # 打开 GUI 并直接定位到某个条目
 app-monitor --select nyaterm --cand 1     # 再指定打开第 2 个版本候选（截图/复现用）
+app-monitor --gpui                        # 用 GPUI 前端启动（需 --features gpui-ui 编译）
 ```
 
 `--check` 不需要图形环境，适合放进定时任务里做巡检。
@@ -232,6 +233,31 @@ AM_ALLOW_DOWNGRADE=1 app-monitor   # 下载允许 https → http 降级（逃生
 >
 > 代价是二进制大 2.95MB（glow 单后端 5.99MB → 双后端 8.9MB）——换来的是虚拟机 / 远程桌面 / 老系统也能跑。
 
+## GPUI 前端（实验，`--gpui`）
+
+界面层另有一条 GPUI 实现（Zed 的 GPU UI 框架，`src/gpui_ui.rs`），编译时用 feature 打开：
+
+```bash
+cargo build --release --features gpui-ui
+app-monitor --gpui
+```
+
+默认入口仍然是 egui。**两套并存**而不是直接替换，有两个硬理由：
+
+- GPUI 的 Windows 后端走 Direct3D 11 + DirectComposition，实际要求 **Windows 10 及以上**；
+  egui 版还承担 Win7/8 的 glow(OpenGL) 兜底，直接切过去这些机器就没界面了。
+- 迁移是按屏推进的，GPUI 版目前覆盖主路径，弹窗类尚未搬完（见下）。
+
+已经对齐：顶栏（计数 / 检查全部更新）、侧栏分组列表与选中态、详情页三个页签、
+版本卡片与版本候选标签、附件列表（下载 / 打开）、下载队列（进度 / 暂停 / 继续 / 取消 / 清空）、
+数据文件损坏提示条。中文直接走系统字体，不需要像 egui 那样手工指定字体文件。
+
+尚未搬过去：添加追踪、设置、下载历史、筛选框与键盘快捷键、各类确认弹窗。
+GPUI 0.2 没有内置文本输入框，要基于 `EntityInputHandler` 自己实现（含 IME），
+这是筛选框与设置窗口的前置工作。
+
+代价：release 体积 9.28MB → 11.66MB（两套 UI 同时编进同一个二进制）。
+
 ## 已知限制
 
 - **HWiNFO** 已改由 masuit.org（懒得勤快的博客）追踪——423down 未收录这个软件。该站有 Cloudflare 人机验证，偶尔会超时，重试即可；被挡住时卡片会提示改用浏览器打开。
@@ -246,7 +272,8 @@ AM_ALLOW_DOWNGRADE=1 app-monitor   # 下载允许 https → http 降级（逃生
 src/
   main.rs          入口、字体、--check / --download / --download-test / --fetch
   app.rs           应用状态、消息泵、下载队列、快捷键、调色板
-  views.rs         全部界面（顶栏 / 侧栏 / 详情 / 队列 / 弹窗）
+  views.rs         egui 界面（顶栏 / 侧栏 / 详情 / 队列 / 弹窗）
+  gpui_ui.rs       实验性 GPUI 前端（--features gpui-ui，入口 --gpui）
   engine.rs        后台任务通道（tokio runtime + mpsc）
   download.rs      断点续传下载器 + SHA-256
   http.rs          HTTP 客户端、per-host cookie、错误中文化

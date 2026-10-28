@@ -6,6 +6,13 @@ description = "跨平台软件追踪下载器 / cross-platform software release 
 authors = ["lordquest <lordquest@163.com>"]
 license = "MIT"
 
+[features]
+default = []
+# 实验性 GPUI 前端（`--gpui`）。默认关闭：正式版仍走 egui，开启后两者共存，
+# 因为 GPUI 的 Windows 后端要求 DirectX 11 + DirectComposition（Win10 及以上），
+# 而 egui 版还承担 Win7/8 的 glow 兜底。
+gpui-ui = ["dep:gpui"]
+
 [dependencies]
 # 双后端，按「DX12 → WARP → glow」顺序兜底（见 src/main.rs 的 RendererChoice）：
 # Windows 上 DX12 覆盖新老显卡，没有显卡时由 WARP 软件光栅化顶上，最后才退 OpenGL。
@@ -40,6 +47,7 @@ rfd = "0.15"
 open = "5"
 percent-encoding = "2"
 log = "0.4"
+gpui = { version = "0.2.2", optional = true }
 
 [profile.release]
 opt-level = "z"

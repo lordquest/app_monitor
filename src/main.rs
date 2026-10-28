@@ -3,6 +3,8 @@
 mod app;
 mod download;
 mod engine;
+#[cfg(feature = "gpui-ui")]
+mod gpui_ui;
 mod html;
 mod http;
 mod model;
@@ -22,6 +24,13 @@ fn main() -> eframe::Result<()> {
     }
     if std::env::args().any(|a| a == "--check") {
         headless_check();
+        return Ok(());
+    }
+    // 实验性 GPUI 前端（需 `cargo build --features gpui-ui`）。默认仍走 egui：
+    // GPUI 的 Windows 后端要求 Win10+，而且功能还没对齐。
+    #[cfg(feature = "gpui-ui")]
+    if std::env::args().any(|a| a == "--gpui") {
+        gpui_ui::run();
         return Ok(());
     }
     if std::env::args().any(|a| a == "--download-test") {
