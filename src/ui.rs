@@ -19,7 +19,7 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App as GpuiApp, AppContext, Application, Bounds, Context, Div, FontWeight,
     InteractiveElement, KeyDownEvent,
-    IntoElement, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    IntoElement, ParentElement, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
     TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder, px, relative,
     rgb, size,
 };
@@ -130,7 +130,7 @@ const RED: u32 = 0xB91C1C;
 const RED_SOFT: u32 = 0xFDECEC;
 const HOVER: u32 = 0xEEF1F6;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Overview,
     Notes,
@@ -1114,6 +1114,17 @@ impl App {
         cx.notify();
     }
 
+    /// 写剪贴板。GPUI 0.2 还没有文本选中，凡是可能想复制走的文本都给一个按钮。
+    fn copy(&mut self, text: impl Into<String>, what: &str, cx: &mut Context<Self>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            self.toast(format!("没有可复制的{what}"), cx);
+            return;
+        }
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.toast(format!("已复制{what}"), cx);
+    }
+
     fn update_count(&self) -> usize {
         self.tracks.iter().filter(|t| t.has_update()).count()
     }
@@ -1327,7 +1338,7 @@ impl App {
             )
     }
 
-    fn main_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn main_panel(&self, text_w: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(track) = self.track().cloned() else {
             return div()
                 .flex_1()
@@ -1345,6 +1356,7 @@ impl App {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .h_full()
             .bg(rgb(BG))
             .child(self.detail_header(&track, view.as_ref(), cx))
@@ -1354,12 +1366,13 @@ impl App {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .gap_3()
                     .px_5()
                     .pb_5()
                     .overflow_y_scroll()
                     .child(match view.as_ref() {
-                        Some(r) => self.release_card(&track, r, sel, cx),
+                        Some(r) => self.release_card(&track, r, sel, text_w, cx),
                         None => self.empty_card(&track),
                     })
                     .when(self.tab == Tab::Overview, |d| {
@@ -1367,6 +1380,8 @@ impl App {
                             div()
                                 .flex()
                                 .flex_col()
+                                .w_full()
+                                .min_w_0()
                                 .gap_2()
                                 .when_some(view.clone(), |d, r| {
                                     d.child(self.asset_card(&track, &r, cx))
@@ -1375,10 +1390,50 @@ impl App {
                     })
                     .when_some(
                         match (self.tab, view.as_ref()) {
-                            (Tab::Notes, Some(r)) if !r.notes.trim().is_empty() => Some(r.notes.clone()),
+                            (Tab::Notes, Some(r)) if !r.notes.trim().is_empty() => {
+                                Some((r.notes.clone(), track.id.clone()))
+                            }
                             _ => None,
                         },
-                        |d, notes| d.child(notes_card(&notes)),
+                        |d, (notes, tid)| {
+                            let copy = notes.clone();
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(rgb(FAINT))
+                                                    .child("更新说明"),
+                                            )
+                                            .child(div().flex_1())
+                                            // GPUI 0.2 没有文本选中，长文本得给个一键复制的出口。
+                                            .child(
+                                                chip(
+                                                    format!("copy-notes-{tid}"),
+                                                    "复制全文",
+                                                    MUTED,
+                                                    0xF2F4F8,
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let c = copy.clone();
+                                                    this.copy(c, "更新说明", cx);
+                                                })),
+                                            ),
+                                    )
+                                    .child(notes_card(&notes, text_w)),
+                            )
+                        },
                     )
                     .when_some(
                         match (self.tab, view.as_ref()) {
@@ -1484,6 +1539,7 @@ impl App {
                                     .text_size(px(11.5))
                                     .text_color(rgb(TEXT))
                                     .text_ellipsis()
+                                    .min_w_0()
                                     .flex_1()
                                     .child(format!("{} · {}", t.spec.app, t.spec.file)),
                             )
@@ -1746,6 +1802,8 @@ impl App {
         div()
             .flex()
             .flex_col()
+            .w_full()
+            .min_w_0()
             .gap_2()
             .p_5()
             .rounded_lg()
@@ -1762,6 +1820,7 @@ impl App {
                 div()
                     .text_size(px(11.5))
                     .text_color(rgb(FAINT))
+                    .whitespace_normal()
                     .child(format!("来源：{}", track.url)),
             )
             .into_any_element()
@@ -1772,12 +1831,17 @@ impl App {
         track: &Track,
         r: &Release,
         sel: usize,
+        text_w: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let url = r.page_url.clone();
+        let copy_url = r.page_url.clone();
+        let ver_text = format!("v{}", r.version);
         div()
             .flex()
             .flex_col()
+            .w_full()
+            .min_w_0()
             .gap_3()
             .p_5()
             .rounded_lg()
@@ -1788,12 +1852,14 @@ impl App {
                 div()
                     .flex()
                     .flex_row()
+                    .min_w_0()
                     .items_start()
                     .gap_3()
                     .child(
                         div()
                             .flex()
                             .flex_col()
+                            .min_w_0()
                             .gap_1()
                             .flex_1()
                             .child(
@@ -1801,12 +1867,13 @@ impl App {
                                     .text_size(px(26.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
-                                    .child(format!("v{}", r.version)),
+                                    .child(ver_text.clone()),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.5))
                                     .text_color(rgb(MUTED))
+                                    .text_ellipsis()
                                     .child(format!(
                                         "{} · 发布于 {} · 来源 {}",
                                         r.title,
@@ -1830,6 +1897,30 @@ impl App {
                         d.child(badge("发现新版本", ORANGE, ORANGE_SOFT))
                     })
                     .child(
+                        chip(
+                            format!("copy-ver-{}", track.id),
+                            "复制版本",
+                            MUTED,
+                            0xF2F4F8,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let t = ver_text.clone();
+                            this.copy(t, "版本号", cx);
+                        })),
+                    )
+                    .child(
+                        chip(
+                            format!("copy-page-{}", track.id),
+                            "复制链接",
+                            MUTED,
+                            0xF2F4F8,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let u = copy_url.clone();
+                            this.copy(u, "来源页链接", cx);
+                        })),
+                    )
+                    .child(
                         btn("btn-open-page", "打开来源页", 0xF2F4F8, TEXT).on_click(cx.listener(
                             move |this, _, _, cx| {
                                 let _ = open::that_detached(&url);
@@ -1838,13 +1929,51 @@ impl App {
                         )),
                     ),
             )
-            .when(!r.summary.trim().is_empty(), |d| {
+            // 概览页只放摘要：完整正文在「更新说明」页签，否则光说明就把附件
+            // 顶到屏幕外了（nyaterm 的 release body 有几十行）。到「更新说明」
+            // 页签里正文由下面的卡片承担，这里就不再重复一遍。
+            .when(!r.summary.trim().is_empty() && self.tab != Tab::Notes, |d| {
+                let compact = self.tab == Tab::Overview;
+                let full: String = r.summary.clone();
+                let shown = if compact { clip(&full, 260) } else { full.clone() };
+                let tid = track.id.clone();
                 d.child(
                     div()
-                        .text_size(px(12.5))
-                        .text_color(rgb(TEXT))
-                        .whitespace_normal()
-                        .child(r.summary.clone()),
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                // 给确定宽度，否则 taffy 会用 min-content 宽度量高度：
+                                // 换行看着是对的，但卡片底部会多出一大块空白。
+                                .w(text_w)
+                                .text_size(px(12.5))
+                                .text_color(rgb(TEXT))
+                                .whitespace_normal()
+                                .child(shown),
+                        )
+                        .when(compact && full.chars().count() > 260, |d| {
+                            // 放在 flex_row 里，否则列方向的 stretch 会把这颗胶囊拉成整行。
+                            d.child(
+                                div().flex().flex_row().child(
+                                    chip(
+                                        format!("more-{tid}"),
+                                        format!(
+                                            "查看完整说明（共 {} 字）",
+                                            full.chars().count()
+                                        ),
+                                        ACCENT,
+                                        ACCENT_SOFT,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tab = Tab::Notes;
+                                        cx.notify();
+                                    })),
+                                ),
+                            )
+                        }),
                 )
             })
             .children((r.candidates.len() > 1).then(|| {
@@ -1890,6 +2019,11 @@ impl Render for App {
             // 关掉弹窗后焦点会悬空，快捷键随之失效，交还给根节点。
             self.root_focus.focus(window);
         }
+        // 正文文本按确定宽度换行：taffy 给自动宽度的换行文本量高度时用的是
+        // min-content 宽度（最长单词的宽度），于是卡片下半截会多出几百像素空白。
+        // 这里按窗口宽度减去侧栏、内边距与边框算一个安全宽度传下去。
+        let vw: f32 = window.viewport_size().width.into();
+        let text_width = px((vw - 370.).max(240.));
         let toast = self.toast.clone();
         div()
             .flex()
@@ -1899,6 +2033,18 @@ impl Render for App {
             .font_family("Microsoft YaHei UI")
             .text_color(rgb(TEXT))
             .track_focus(&self.root_focus)
+            // AM_LOG_MOUSE=1：把鼠标事件与缩放因子打到 stderr，排查「点了没反应」时用。
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(
+                |_, ev: &gpui::MouseDownEvent, window, _| {
+                    if std::env::var_os("AM_LOG_MOUSE").is_some() {
+                        eprintln!(
+                            "[mouse] down at {:?} scale {}",
+                            ev.position,
+                            window.scale_factor()
+                        );
+                    }
+                },
+            ))
             // 快捷键的 action 监听必须挂在元素上：`Window::on_action` 只能在
             // dispatch 树构建期间注册，窗口刚建好时注册会 panic。
             .on_action(cx.listener(|this, _: &AddTrack, _, cx| {
@@ -2020,7 +2166,7 @@ impl Render for App {
                     .flex_1()
                     .overflow_hidden()
                     .child(self.sidebar(cx))
-                    .child(self.main_panel(cx)),
+                    .child(self.main_panel(text_width, cx)),
             )
             .child(self.queue_panel(cx))
             .child(self.dialog_layer(cx))
@@ -2126,6 +2272,7 @@ fn toggle(
 fn btn(id: &'static str, text: &'static str, bg: u32, fg: u32) -> Stateful<Div> {
     div()
         .id(id)
+        .flex_shrink_0()
         .px_3()
         .py_2()
         .rounded_md()
@@ -2135,6 +2282,38 @@ fn btn(id: &'static str, text: &'static str, bg: u32, fg: u32) -> Stateful<Div> 
         .hover(|s| s.opacity(0.88))
         .cursor_pointer()
         .child(text)
+}
+
+/// 按字符（不是字节）截断，超长补省略号。
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// 次要动作的小胶囊（复制、打开链接、标签切换这类）。id 需要动态拼接，所以
+/// 不接受 `&'static str` —— 附件行的 id 里带文件名。
+fn chip(
+    id: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+    fg: u32,
+    bg: u32,
+) -> Stateful<Div> {
+    div()
+        .id(id.into())
+        .flex_shrink_0()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(bg))
+        .text_size(px(10.5))
+        .text_color(rgb(fg))
+        .hover(|s| s.opacity(0.85))
+        .cursor_pointer()
+        .child(text.into())
 }
 
 impl App {
@@ -2619,6 +2798,8 @@ impl App {
         div()
             .flex()
             .flex_col()
+            .w_full()
+            .min_w_0()
             .gap_2()
             .p_4()
             .rounded_lg()
@@ -2659,12 +2840,19 @@ impl App {
                 let btn_id = format!("dl-{}-{}", track_id, a.name);
                 let (tid, ver, pg) = (track_id.clone(), version.clone(), page_url.clone());
                 let asset_for_click = a.clone();
+                // 「直链 / 页面」标签也做成可点的：点它跟点右侧主按钮等价，
+                // 否则用户点那两个字（它看起来像链接）会以为程序没反应。
+                let badge_asset = a.clone();
+                let (btid, bver, bpg) = (track_id.clone(), version.clone(), page_url.clone());
+                let copy_text = a.url.clone();
+                let copy_name = a.name.clone();
                 div()
                     .id(SharedString::from(row_id))
                     .flex()
                     .flex_row()
+                    .min_w_0()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .px_2()
                     .py_2()
                     .rounded_md()
@@ -2673,6 +2861,7 @@ impl App {
                         div()
                             .flex()
                             .flex_col()
+                            .min_w_0()
                             .gap_1()
                             .flex_1()
                             .child(
@@ -2686,6 +2875,7 @@ impl App {
                                 div()
                                     .text_size(px(10.5))
                                     .text_color(rgb(FAINT))
+                                    .text_ellipsis()
                                     .child(format!(
                                         "{}{}{}",
                                         a.size
@@ -2700,14 +2890,33 @@ impl App {
                                     )),
                             ),
                     )
-                    .child(badge(
-                        if direct { "直链" } else { "页面" },
-                        if direct { GREEN } else { MUTED },
-                        if direct { GREEN_SOFT } else { 0xF2F4F8 },
-                    ))
+                    .child(
+                        chip(
+                            format!("kind-{}-{}", track_id, a.name),
+                            if direct { "直链" } else { "页面" },
+                            if direct { GREEN } else { MUTED },
+                            if direct { GREEN_SOFT } else { 0xF2F4F8 },
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.start_asset(&btid, &bver, &badge_asset, &bpg, cx);
+                        })),
+                    )
+                    .child(
+                        chip(
+                            format!("copy-{}-{}", track_id, a.name),
+                            "复制",
+                            MUTED,
+                            0xF2F4F8,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let (t, n) = (copy_text.clone(), copy_name.clone());
+                            this.copy(t, &format!("「{n}」的链接"), cx);
+                        })),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(btn_id))
+                            .flex_shrink_0()
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -2725,10 +2934,12 @@ impl App {
     }
 }
 
-fn notes_card(notes: &str) -> impl IntoElement {
+fn notes_card(notes: &str, text_w: Pixels) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w_0()
         .p_5()
         .rounded_lg()
         .bg(rgb(CARD))
@@ -2736,6 +2947,7 @@ fn notes_card(notes: &str) -> impl IntoElement {
         .border_color(rgb(BORDER))
         .child(
             div()
+                .w(text_w)
                 .text_size(px(12.5))
                 .line_height(px(20.))
                 .text_color(rgb(TEXT))
@@ -2748,6 +2960,8 @@ fn history_card(hist: &[crate::model::VersionEntry]) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w_0()
         .gap_3()
         .p_5()
         .rounded_lg()
@@ -2758,6 +2972,7 @@ fn history_card(hist: &[crate::model::VersionEntry]) -> impl IntoElement {
             div()
                 .flex()
                 .flex_col()
+                .min_w_0()
                 .gap_1()
                 .child(
                     div()
