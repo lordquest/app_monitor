@@ -13,6 +13,11 @@
 .shots/
 .shots_run.log
 
+# Throwaway UI-automation scripts and screenshots used to verify the window
+.shot.py
+.shot*.png
+.*-test.py
+
 # Editor / OS noise
 .idea/
 .vscode/

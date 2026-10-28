@@ -1,41 +1,28 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
-mod app;
 mod download;
 mod engine;
-#[cfg(feature = "gpui-ui")]
-mod gpui_ui;
 mod html;
 mod http;
 mod model;
 mod parse;
 mod provider;
 mod store;
+mod ui;
 mod util;
-mod views;
 
-use std::path::PathBuf;
-
-use eframe::egui;
-
-fn main() -> eframe::Result<()> {
+fn main() {
+    install_panic_dialog();
     if std::env::var("AM_DEBUG").is_ok() || std::env::var("AM_LOG").is_ok() {
         install_logger();
     }
     if std::env::args().any(|a| a == "--check") {
         headless_check();
-        return Ok(());
-    }
-    // 实验性 GPUI 前端（需 `cargo build --features gpui-ui`）。默认仍走 egui：
-    // GPUI 的 Windows 后端要求 Win10+，而且功能还没对齐。
-    #[cfg(feature = "gpui-ui")]
-    if std::env::args().any(|a| a == "--gpui") {
-        gpui_ui::run();
-        return Ok(());
+        return;
     }
     if std::env::args().any(|a| a == "--download-test") {
         download_cli(None, None);
-        return Ok(());
+        return;
     }
     // `--download <名称> [--asset <子串>]`：真下载某个追踪项的一个附件到 ./.selftest。
     // 大文件下载出问题时（超时 / 续传 / 校验）这是唯一不依赖界面的复现手段。
@@ -47,7 +34,7 @@ fn main() -> eframe::Result<()> {
             .position(|a| a == "--asset")
             .and_then(|i| std::env::args().nth(i + 1));
         download_cli(name.as_deref(), asset.as_deref());
-        return Ok(());
+        return;
     }
     if let Some(pos) = std::env::args().position(|a| a == "--fetch") {
         let url = std::env::args().nth(pos + 1).unwrap_or_default();
@@ -55,7 +42,7 @@ fn main() -> eframe::Result<()> {
             .position(|a| a == "--save")
             .and_then(|i| std::env::args().nth(i + 1));
         fetch_probe(&url, save.as_deref());
-        return Ok(());
+        return;
     }
 
     // `--select <名称> --cand <n>`: open a specific item (and candidate tab) directly.
@@ -69,113 +56,34 @@ fn main() -> eframe::Result<()> {
             .and_then(|j| args.get(j + 1))
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        app::set_start_hint(name, cand);
+        ui::set_start_hint(name, cand);
     }
 
-    let choice = RendererChoice::from_env();
-    if let Err(err) = launch(choice) {
-        // DX12 起不来（Win7/8、驱动异常、适配器不可用）就退 OpenGL；
-        // 两条路都失败才弹窗，避免"双击毫无反应"。
-        if matches!(choice.renderer, eframe::Renderer::Wgpu) {
-            log::warn!("DX12 后端启动失败: {err}，改用 glow(OpenGL) 重试");
-            if launch(RendererChoice::glow()).is_ok() {
-                return Ok(());
-            }
-        }
-        report_fatal(&format!("{err}"));
-        return Err(err);
-    }
-    Ok(())
+    ui::run();
 }
 
-/// 渲染后端：Windows 优先 DX12，失败退回 glow。
-///
-/// 兼容性覆盖顺序：
-/// 1. **DX12 硬件适配器** —— D3D12 FL11_0 自 Kepler / HD 5000 一代起就有，新老独显/集显都能跑；
-/// 2. **DX12 WARP** —— 没有可用显卡时（未装驱动的虚拟机、纯 RDP 会话、Basic Display Adapter），
-///    Windows 自带的软件光栅化顶上。egui-wgpu 请求适配器时 `force_fallback_adapter: false`，
-///    所以有硬件就优先硬件，没有才落到 WARP，正是我们要的行为；
-/// 3. **glow(OpenGL 3.3)** —— Win7/8 这类没有 DX12 的老系统，或 DX12 初始化失败；
-/// 4. 都失败 → 弹窗提示更新显卡驱动。
-///
-/// 关键点：wgpu 只编入 `dx12` 后端，**绝不枚举 Vulkan** —— 老 NVIDIA 驱动（实测 425.31 /
-/// Kepler 移动显卡）在 Vulkan 首帧 present 时会崩在驱动内部（`nvoglv64.dll`），
-/// `panic = "abort"` + `windows_subsystem = "windows"` 意味着接不住也打不出日志。
-///
-/// 非 Windows 平台直接用 glow，不启用 metal/vulkan 特性，避免半配置的 wgpu 后端。
-/// `AM_GL=1` 可强制走 OpenGL（排障用）。
-#[derive(Clone, Copy, Debug)]
-struct RendererChoice {
-    renderer: eframe::Renderer,
-    backends: wgpu::Backends,
-}
-
-impl RendererChoice {
-    fn glow() -> Self {
-        Self {
-            renderer: eframe::Renderer::Glow,
-            backends: wgpu::Backends::empty(),
-        }
-    }
-
-    fn dx12() -> Self {
-        Self {
-            renderer: eframe::Renderer::Wgpu,
-            backends: wgpu::Backends::DX12,
-        }
-    }
-
-    fn from_env() -> Self {
-        if std::env::var("AM_GL").is_ok() {
-            log::info!("AM_GL 已设置，强制使用 glow(OpenGL)");
-            return Self::glow();
-        }
-        if cfg!(target_os = "windows") {
-            Self::dx12()
-        } else {
-            Self::glow()
-        }
-    }
-}
-
-fn launch(choice: RendererChoice) -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([980.0, 640.0])
-            .with_title("App Monitor · 软件追踪下载器"),
-        renderer: choice.renderer,
-        // 限定后端：只允许 DX12，避免 wgpu 自己挑到会崩的组合。
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            supported_backends: choice.backends,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "app-monitor",
-        options,
-        Box::new(|cc| {
-            setup_fonts(&cc.egui_ctx);
-            app::setup_style(&cc.egui_ctx);
-            Ok(Box::new(app::App::new()))
-        }),
-    )
-}
-
-/// GUI 子系统没有控制台，出错必须弹窗，否则就是"双击没反应"。
-fn report_fatal(msg: &str) {
-    eprintln!("app-monitor 启动失败: {msg}");
-    let _ = rfd::MessageDialog::new()
-        .set_title("App Monitor 启动失败")
-        .set_description(format!(
-            "{msg}\n\n界面需要 DirectX 12（含 WARP 软件渲染）或 OpenGL 3.3 或更高版本。\
-             若本机没有可用的显卡驱动（例如未安装驱动的虚拟机、或纯远程桌面会话），\
-             请更新显卡驱动后重试。"
-        ))
-        .set_level(rfd::MessageLevel::Error)
-        .show();
+/// GUI 子系统没有控制台。Windows 上 `panic = "abort"` 意味着一次启动失败就是
+/// 「双击没反应」，所以装一个 hook：先弹窗把原因说清楚（同时写进
+/// `app_monitor_data/last-crash.txt`），再让进程按原方式退出。
+fn install_panic_dialog() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.to_string();
+        let dir = crate::store::data_dir().clone();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("last-crash.txt"), &msg);
+        eprintln!("app-monitor 崩溃: {msg}");
+        let _ = rfd::MessageDialog::new()
+            .set_title("App Monitor 意外退出")
+            .set_description(format!(
+                "{msg}\n\n详细信息已写入 {}。\
+                 界面需要 Windows 10 及以上（Direct3D 11 + DirectComposition）。",
+                dir.join("last-crash.txt").display()
+            ))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+        default_hook(info);
+    }));
 }
 
 /// `--fetch <url> [--save out.html]`: fetch a page through the app's own HTTP
@@ -389,8 +297,7 @@ fn headless_check() {
     }
 }
 
-/// Diagnostic logger (only active with `AM_DEBUG` / `AM_LOG`): eframe reports
-/// GL / winit problems through `log`, and without a logger they disappear.
+/// Diagnostic logger (only active with `AM_DEBUG` / `AM_LOG`).
 fn install_logger() {
     struct Stderr;
     impl log::Log for Stderr {
@@ -405,61 +312,4 @@ fn install_logger() {
     static LOGGER: Stderr = Stderr;
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Debug);
-}
-
-/// egui ships a Latin-only font; load a system CJK face so Chinese labels render.
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    for path in font_candidates() {
-        if let Ok(bytes) = std::fs::read(&path) {
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
-            if let Some(p) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                p.insert(0, "cjk".to_owned());
-            }
-            if let Some(m) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                m.push("cjk".to_owned());
-            }
-            break;
-        }
-    }
-    ctx.set_fonts(fonts);
-}
-
-fn font_candidates() -> Vec<PathBuf> {    let mut v: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let fonts = dir.join("fonts");
-            if let Ok(entries) = std::fs::read_dir(&fonts) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if matches!(
-                        p.extension().and_then(|s| s.to_str()),
-                        Some("ttf") | Some("ttc") | Some("otf")
-                    ) {
-                        v.push(p);
-                    }
-                }
-            }
-        }
-    }
-    if cfg!(target_os = "windows") {
-        v.push("C:/Windows/Fonts/msyh.ttc".into());
-        v.push("C:/Windows/Fonts/msyh.ttf".into());
-        v.push("C:/Windows/Fonts/simhei.ttf".into());
-        v.push("C:/Windows/Fonts/simsun.ttc".into());
-    } else if cfg!(target_os = "macos") {
-        v.push("/System/Library/Fonts/PingFang.ttc".into());
-        v.push("/System/Library/Fonts/STHeiti Light.ttc".into());
-        v.push("/Library/Fonts/Arial Unicode.ttf".into());
-    } else {
-        v.push("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc".into());
-        v.push("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".into());
-        v.push("/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf".into());
-        v.push("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc".into());
-        v.push("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc".into());
-        v.push("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf".into());
-    }
-    v
 }

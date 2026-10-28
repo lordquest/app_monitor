@@ -4,7 +4,7 @@
 ![build](https://img.shields.io/github/actions/workflow/status/lordquest/app_monitor/release.yml?label=build)
 ![license](https://img.shields.io/github/license/lordquest/app_monitor)
 
-用 Rust + egui 写的桌面小工具：**给它一堆「网站 / 仓库 + 软件名」，它替你盯着最新版本**，把版本号、发布时间、更新说明和下载直链整理到一张卡片上，你决定要不要下，它负责下（断点续传 + SHA-256 校验）。
+用 Rust + GPUI 写的桌面小工具：**给它一堆「网站 / 仓库 + 软件名」，它替你盯着最新版本**，把版本号、发布时间、更新说明和下载直链整理到一张卡片上，你决定要不要下，它负责下（断点续传 + SHA-256 校验）。
 
 ![概览](docs/screenshot-overview.png)
 
@@ -34,11 +34,11 @@
 
 | 平台 | 文件 |
 | --- | --- |
-| Windows x64 | `app-monitor-v0.1.1-windows-x64.zip`（`app-monitor.exe`） |
-| Linux x64 | `app-monitor-v0.1.1-linux-x64.tar.gz`（需 X11/Wayland + OpenGL 3.3） |
-| macOS arm64（Apple Silicon） | `app-monitor-v0.1.1-macos-arm64.tar.gz`（未签名，首次运行如被拦截执行 `xattr -d com.apple.quarantine ./app-monitor`） |
+| Windows x64 | `app-monitor-v0.2.0-windows-x64.zip`（`app-monitor.exe`，需要 Windows 10 及以上） |
+| Linux x64 | `app-monitor-v0.2.0-linux-x64.tar.gz`（需 X11/Wayland + Vulkan 驱动） |
+| macOS arm64（Apple Silicon） | `app-monitor-v0.2.0-macos-arm64.tar.gz`（未签名，首次运行如被拦截执行 `xattr -d com.apple.quarantine ./app-monitor`） |
 
-Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来自 GitHub Actions 同一份源码构建。版本号见 tag，本仓库目前对应 `0.1.1`。
+Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来自 GitHub Actions 同一份源码构建。版本号见 tag，本仓库目前对应 `0.2.0`。
 
 ## 特性
 
@@ -56,7 +56,7 @@ Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来�
 ## 快速开始
 
 ```bash
-cargo run            # 开发运行（Windows 默认 DX12，其余平台 OpenGL）
+cargo run            # 开发运行（Windows 需要 10 及以上；界面走 D3D11）
 cargo run --release  # 发布运行
 ```
 
@@ -77,13 +77,14 @@ Windows 版通过 `.cargo/config.toml` 里的 `-C target-feature=+crt-static` �
 `.github/workflows/release.yml` 在三个 runner 上并行 `cargo build --release`（Windows x64 / Linux x64 / macOS arm64），并把产物打包上传：
 
 ```bash
-git tag -a v0.1.1 -m "app-monitor v0.1.1"   # 打 tag 即触发构建 + 发布 Release
-git push origin v0.1.1
+git tag -a v0.2.0 -m "app-monitor v0.2.0"   # 打 tag 即触发构建 + 发布 Release
+git push origin v0.2.0
 ```
 
 - 打 `v*` tag → 构建完成后自动创建 Release 并挂上三平台附件（含 `README.md` / `LICENSE`）。
 - 在 Actions 页面手动 `Run workflow` → 只构建并保留 artifact（14 天），不发布，方便先验证。
-- 构建使用 `Swatinem/rust-cache`，Linux 侧自动安装 winit/glow 需要的 X11 / Wayland / GL 头文件。
+- 构建使用 `Swatinem/rust-cache`，Linux 侧自动安装 GPUI 需要的 X11 / Wayland / fontconfig /
+  freetype / Vulkan 开发包。
 - 公开仓库的 Actions 分钟数不额外计费；release 附件按仓库流量计算。
 
 首次启动会用内置的默认清单播种（就是本项目的示例清单），按 `Ctrl+N` 可以粘贴自己的清单。
@@ -185,8 +186,8 @@ AM_ALLOW_DOWNGRADE=1 app-monitor    # Windows: set AM_ALLOW_DOWNGRADE=1 && app-m
 | 键 | 作用 |
 | --- | --- |
 | `Ctrl+1 / 2 / 3` | 概览 / 更新说明 / 历史版本 |
-| `Ctrl+D` | 下载当前条目的首选直链 |
 | `Ctrl+N` | 添加追踪 |
+| `Ctrl+F` | 聚焦侧栏筛选框 |
 | `Ctrl+H` | 下载历史 |
 | `Ctrl+,` | 设置 |
 | `Esc` | 关闭弹窗 |
@@ -202,67 +203,55 @@ app-monitor --download-test    # 真下载第一个 GitHub 项的 Windows 附件
 app-monitor --download Netcatty --asset win-x64.zip   # 下载指定条目的指定附件（大文件/续传问题复现用）
 app-monitor --select nyaterm              # 打开 GUI 并直接定位到某个条目
 app-monitor --select nyaterm --cand 1     # 再指定打开第 2 个版本候选（截图/复现用）
-app-monitor --gpui                        # 用 GPUI 前端启动（需 --features gpui-ui 编译）
 ```
 
 `--check` 不需要图形环境，适合放进定时任务里做巡检。
 
-## 渲染后端
+## 界面层（GPUI）
 
-Windows 上按 **DX12 → WARP → glow(OpenGL)** 顺序兜底，目标是「什么机器都能起来」：
+界面用 [GPUI](https://www.gpui.rs/)（Zed 的 GPU UI 框架）实现，只有这一套 UI，没有并存分支。
+换掉 egui 的理由：
 
-| 顺序 | 后端 | 覆盖的场景 |
-|---|---|---|
-| 1 | **DX12 硬件适配器** | 新老独显/集显（D3D12 FL11_0 自 Kepler / HD 5000 一代起就有） |
-| 2 | **DX12 WARP** | 没有可用显卡：未装驱动的虚拟机、纯 RDP 会话、Basic Display Adapter。WARP 是 Windows 自带的软件光栅化，不需要任何 GPU |
-| 3 | **glow（OpenGL 3.3）** | Win7/8 这类没有 DX12 的老系统，或 DX12 初始化失败 |
-| 4 | 弹窗 | 以上全失败时提示更新显卡驱动，而不是白屏/静默退出 |
+- 渲染路径统一，不需要自己维护「DX12 → WARP → glow」的后端选择与失败兜底：
+  Windows 走 Direct3D 11 + DirectComposition，macOS 走 Metal，Linux 走 Vulkan/blade。
+- 依赖树小得多（不再带 eframe / egui / wgpu / naga / glow）：`Cargo.lock` 里的包从 833 个降到
+  724 个，少 109 个 crate、约 1.3k 行锁文件。
 
-非 Windows 平台直接用 glow。`AM_GL=1` 可强制走 OpenGL（排障用）。
-
-```bash
-AM_GL=1 app-monitor    # 强制 OpenGL/WGL（Windows: set AM_GL=1 && app-monitor.exe）
-AM_LOG=1 app-monitor   # 打开 eframe / wgpu 的调试日志，能看到实际选中的后端与适配器
-AM_ALLOW_DOWNGRADE=1 app-monitor   # 下载允许 https → http 降级（逃生阀，见上一节）
-```
-
-> **只编 DX12 一个 wgpu 后端，绝不启用 Vulkan。** wgpu 默认会先枚举 Vulkan 适配器，而部分老驱动
-> （实测 NVIDIA 425.31 / Kepler 移动显卡）在 Vulkan 首帧 present 时会在驱动内部访问违例崩溃，
-> `panic = "abort"` 下连报错都没有，用户看到的现象就是「双击毫无反应」。`Cargo.toml` 里
-> `wgpu` 显式只开 `dx12` 特性就是为了封死这条路。
->
-> 代价是二进制大 2.95MB（glow 单后端 5.99MB → 双后端 8.9MB）——换来的是虚拟机 / 远程桌面 / 老系统也能跑。
-
-## GPUI 前端（实验，`--gpui`）
-
-界面层另有一条 GPUI 实现（Zed 的 GPU UI 框架，`src/gpui_ui.rs`），编译时用 feature 打开：
+代价是**只支持 Windows 10 及以上**：D3D11 + DirectComposition 在更早的系统上不完整。
+Win7/8 用户请留在 [v0.1.2](https://github.com/lordquest/app_monitor/releases/tag/v0.1.2)
+（最后一个 egui 版本）。
 
 ```bash
-cargo build --release --features gpui-ui
-app-monitor --gpui
+AM_LOG=1 app-monitor              # 打开调试日志
+AM_ALLOW_DOWNGRADE=1 app-monitor  # 下载允许 https → http 降级（逃生阀，见上一节）
+AM_START_DIALOG=settings app-monitor   # 启动即打开弹窗：add / settings / history（截图与复现用）
 ```
 
-默认入口仍然是 egui。**两套并存**而不是直接替换，有两个硬理由：
+### 自绘输入框
 
-- GPUI 的 Windows 后端走 Direct3D 11 + DirectComposition，实际要求 **Windows 10 及以上**；
-  egui 版还承担 Win7/8 的 glow(OpenGL) 兜底，直接切过去这些机器就没界面了。
-- 迁移是按屏推进的，GPUI 版目前覆盖主路径，弹窗类尚未搬完（见下）。
+GPUI 0.2 没有内置文本控件，所以「添加追踪 / 设置 / 筛选」三处的输入框是自己实现的：
 
-已经对齐：顶栏（计数 / 检查全部更新）、侧栏分组列表与选中态、详情页三个页签、
-版本卡片与版本候选标签、附件列表（下载 / 打开）、下载队列（进度 / 暂停 / 继续 / 取消 / 清空）、
-数据文件损坏提示条。中文直接走系统字体，不需要像 egui 那样手工指定字体文件。
+- 支持可打印字符、退格、Delete、左右 / Home / End、**Ctrl+V 粘贴**、Ctrl+A 全选后再输入即替换；
+- **不走输入法（IME）**：这三处填的是 URL、目录、Token、代理地址，全是 ASCII；粘进来也不受
+  键盘布局影响。追踪项的名称由 URL 推导，不需要手工键入中文。
+- 编辑逻辑抽成了 `EditState`（纯字符串、不碰窗口），因此 UTF-8 边界、CRLF 归一这些容易出错的
+  地方都有单测覆盖。
 
-尚未搬过去：添加追踪、设置、下载历史、筛选框与键盘快捷键、各类确认弹窗。
-GPUI 0.2 没有内置文本输入框，要基于 `EntityInputHandler` 自己实现（含 IME），
-这是筛选框与设置窗口的前置工作。
+### 快捷键的两个坑
 
-代价：release 体积 9.28MB → 11.66MB（两套 UI 同时编进同一个二进制）。
+- `Window::on_action` 只能在 dispatch 树构建期间（也就是元素渲染时）注册，窗口刚建好就注册会
+  在 `key_dispatch.rs` 里 `unwrap()` 到 `None` 直接 panic。所以 action 监听挂在根元素的
+  `.on_action(...)` 上。
+- 一个可聚焦元素都没有时，按键派发的 `active_node` 为空，同样会 panic。根元素因此也
+  `track_focus`，并在没有弹窗时持有焦点；打开弹窗则把焦点交给输入框。
 
 ## 已知限制
 
 - **HWiNFO** 已改由 masuit.org（懒得勤快的博客）追踪——423down 未收录这个软件。该站有 Cloudflare 人机验证，偶尔会超时，重试即可；被挡住时卡片会提示改用浏览器打开。
 - pc528 的下载区需要登录/回复可见，卡片会标注，需点「打开来源页面」。
 - 网盘（夸克/百度/蓝奏/123）只能在浏览器打开，不参与自动下载。
+- 自绘输入框不支持中文输入法；这几处不填中文，需要中文标题时靠粘贴。
+- 界面要求 Windows 10 及以上；Win7/8 只能用 v0.1.2。
 - 软件站解析依赖站内搜索的 HTML 结构，站点改版可能导致匹配失败——`--check --verbose` 可快速定位。
 - 若下载返回 403，多为代理/防火墙拦截或站点防盗链，可先用 `打开来源页面` 在浏览器里确认。
 
@@ -270,10 +259,8 @@ GPUI 0.2 没有内置文本输入框，要基于 `EntityInputHandler` 自己实�
 
 ```
 src/
-  main.rs          入口、字体、--check / --download / --download-test / --fetch
-  app.rs           应用状态、消息泵、下载队列、快捷键、调色板
-  views.rs         egui 界面（顶栏 / 侧栏 / 详情 / 队列 / 弹窗）
-  gpui_ui.rs       实验性 GPUI 前端（--features gpui-ui，入口 --gpui）
+  main.rs          入口、崩溃弹窗、--check / --download / --download-test / --fetch
+  ui.rs            界面：状态与消息泵、顶栏 / 侧栏 / 详情 / 队列、自绘输入框与弹窗
   engine.rs        后台任务通道（tokio runtime + mpsc）
   download.rs      断点续传下载器 + SHA-256
   http.rs          HTTP 客户端、per-host cookie、错误中文化

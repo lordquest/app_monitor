@@ -228,20 +228,6 @@ impl Track {
             _ => false,
         }
     }
-
-    pub fn host(&self) -> String {
-        url_host(&self.url)
-    }
-}
-
-pub fn url_host(url: &str) -> String {
-    url.split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or(url)
-        .to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

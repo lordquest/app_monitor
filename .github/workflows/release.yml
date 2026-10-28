@@ -35,17 +35,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # winit / glow 在 Linux 上需要 X11 + Wayland + GL 的头文件；
-      # Windows 与 macOS 用 runner 自带的工具链即可。
+      # GPUI 在 Linux 上同时编 X11 与 Wayland 两套后端（默认 feature），
+      # 还要 font-kit（fontconfig / freetype）与 Vulkan 加载器；Windows / macOS
+      # 用 runner 自带的工具链即可。
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxi-dev libgl1-mesa-dev libgtk-3-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            pkg-config
+            pkg-config libssl-dev \
+            libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libwayland-cursor0 \
+            libfontconfig1-dev libfreetype-dev \
+            libvulkan-dev mesa-vulkan-drivers \
+            libgtk-3-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -79,7 +82,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/app-monitor.exe" $stage
           Copy-Item README.md, LICENSE $stage
-          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+          # 传目录而不是 "$stage/*"：解压后与其他平台的 tar.gz 一样带一层版本目录。
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           Get-ChildItem dist
 
       - name: Package (Linux / macOS)
@@ -120,5 +124,7 @@ jobs:
             首次启动会在可执行文件旁创建 `app_monitor_data/` 存放配置与追踪清单。
 
             - macOS 未签名，首次运行若被拦截：`xattr -d com.apple.quarantine ./app-monitor`
-            - Linux / macOS 走 glow（OpenGL 3.3），需要 X11/Wayland 与对应驱动；Windows 走 DX12 → WARP → glow 兜底
+            - 界面基于 GPUI：Windows 需要 Windows 10 及以上（Direct3D 11 + DirectComposition），
+              Linux 需要 Vulkan 驱动与 X11/Wayland 会话，macOS 走 Metal
+            - Linux 若缺 `libxkbcommon` / `libwayland-client`，装上对应的发行版包即可
             - 非 GitHub 附件常无官方摘要：下载列表会标 `· 无官方摘要`，明文链接标 `· 明文 http`

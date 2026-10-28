@@ -1,26 +1,15 @@
 [package]
 name = "app-monitor"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "跨平台软件追踪下载器 / cross-platform software release tracker"
 authors = ["lordquest <lordquest@163.com>"]
 license = "MIT"
 
-[features]
-default = []
-# 实验性 GPUI 前端（`--gpui`）。默认关闭：正式版仍走 egui，开启后两者共存，
-# 因为 GPUI 的 Windows 后端要求 DirectX 11 + DirectComposition（Win10 及以上），
-# 而 egui 版还承担 Win7/8 的 glow 兜底。
-gpui-ui = ["dep:gpui"]
-
 [dependencies]
-# 双后端，按「DX12 → WARP → glow」顺序兜底（见 src/main.rs 的 RendererChoice）：
-# Windows 上 DX12 覆盖新老显卡，没有显卡时由 WARP 软件光栅化顶上，最后才退 OpenGL。
-eframe = { version = "0.29", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
-egui = "0.29"
-# 只编 DX12 一个后端：绝不能让 wgpu 去枚举 Vulkan —— 老 NVIDIA 驱动（425.31 / Kepler）
-# 在 Vulkan 首帧 present 时会在驱动内部访问违例崩溃，且 panic = "abort" 接不住。
-wgpu = { version = "22.1", default-features = false, features = ["dx12"] }
+# 界面层。GPUI 的 Windows 后端是 Direct3D 11 + DirectComposition（Win10+），
+# macOS 走 Metal，Linux 走 Vulkan/blade —— 不需要我们自己维护后端选择与兜底链。
+gpui = "0.2.2"
 # rustls-tls keeps the binary self-contained on Windows / Linux / macOS.
 # gzip/brotli/deflate: the HTML parser is the hot path of a resolve, and the
 # download sites serve 100-400KB pages; without decompression every one of them
@@ -47,7 +36,6 @@ rfd = "0.15"
 open = "5"
 percent-encoding = "2"
 log = "0.4"
-gpui = { version = "0.2.2", optional = true }
 
 [profile.release]
 opt-level = "z"
