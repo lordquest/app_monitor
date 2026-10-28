@@ -37,6 +37,15 @@ open = "5"
 percent-encoding = "2"
 log = "0.4"
 
+# ---- 仅为钉住一个版本而声明的依赖，代码里不直接用 ----
+# gpui → gpui_http_client → zed-async-tar → xattr 0.2.3，而 xattr 0.2.3 在 Linux 上
+# 引用了 `libc::ENOATTR`。libc 0.2.190 把这个早已 deprecated 的别名从 linux_like 里
+# 删掉了，于是 ubuntu runner 上编译到 xattr 就报 E0425（"cannot find value ENOATTR"）。
+# xattr 0.2.x 不再发布新版本，zed-async-tar 又写死 `xattr = "0.2"`，所以在只能在这里
+# 把 libc 钉在还带该别名的最后一个版本上。等 zed-async-tar 换到 xattr 1.x 就能删掉。
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.188"
+
 [profile.release]
 opt-level = "z"
 lto = true
