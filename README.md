@@ -2,6 +2,8 @@
 
 <img src="assets/icon.png" width="72" align="right" alt="App Monitor 图标">
 
+**简体中文** · [English](README.en.md)
+
 ![release](https://img.shields.io/github/v/release/lordquest/app_monitor?label=release)
 ![build](https://img.shields.io/github/actions/workflow/status/lordquest/app_monitor/release.yml?label=build)
 ![license](https://img.shields.io/github/license/lordquest/app_monitor)
@@ -11,16 +13,17 @@
 ![概览](docs/screenshot-overview.png)
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│ App Monitor  跨平台软件追踪下载器  [9 个追踪项] 下载队列 1 检查全部更新│
-├───────────────┬──────────────────────────────────────────────────────┤
-│ 追踪列表   9  │ nyaterm                       已是最新               │
-│ GitHub 项目 3 │ GitHub 项目 · nyakang/nyaterm · GitHub Releases       │
-│  deepxcode    │ 概览 │ 更新说明 │ 历史版本                            │
+┌───────────────┬──────────────────────────────────────────────────────┐
+│ App Monitor   │ 跨平台软件追踪下载器 · 9 个追踪项 · 队列 1           │
+├───────────────┼──────────────────────────────────────────────────────┤
+│ 追踪列表    9 │ nyaterm                       已是最新               │
+│ GitHub 项目 3 │ GitHub 项目 · nyakang/nyaterm · GitHub Releases      │
+│  deepxcode    │ 概览 │ 更新说明 │ 历史版本                           │
 │  █████░░░░░░  │ ┌──────────────────────────────────────────────────┐ │
-│  nyaterm      │ │ 最新版本  1.3.0        ⚠ 另有预发布 2.0.0-preview │ │
-│  strata       │ │ 更新摘要 …                                        │ │
-│ 软件站 4      │ │ 下载文件 17 个：windows_x64.msi · 24.8 MB · sha…  │ │
+│  nyaterm      │ │ 最新版本  1.3.0       ⚠ 另有预发布 2.0.0-preview │ │
+│  strata       │ │ 更新摘要 …                                       │ │
+│ 软件站      4 │ │ 下载文件 17 个：windows_x64.msi · 24.8 MB · sha… │ │
+│               │ └──────────────────────────────────────────────────┘ │
 └───────────────┴──────────────────────────────────────────────────────┘
 ```
 

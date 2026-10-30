@@ -81,7 +81,7 @@ jobs:
           $stage = "dist/${{ steps.ver.outputs.stage }}"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/app-monitor.exe" $stage
-          Copy-Item README.md, LICENSE $stage
+          Copy-Item README.md, README.en.md, LICENSE $stage
           # 传目录而不是 "$stage/*"：解压后与其他平台的 tar.gz 一样带一层版本目录。
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           # 打好的目录要删掉：dist 里只留压缩包，否则 artifact 会把 exe 再传一份。
@@ -95,7 +95,7 @@ jobs:
           stage="dist/${{ steps.ver.outputs.stage }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/app-monitor" "$stage/"
-          cp README.md LICENSE "$stage/"
+          cp README.md README.en.md LICENSE "$stage/"
           tar -czf "$stage.tar.gz" -C dist "${{ steps.ver.outputs.stage }}"
           # 同上：只留 tar.gz，别让 artifact 重复打包解压后的目录。
           rm -rf "$stage"
@@ -117,6 +117,7 @@ jobs:
           fail_on_unmatched_files: true
           body: |
             跨平台软件追踪下载器 `app-monitor` ${{ github.ref_name }}。
+            A cross-platform release tracker — see the [English README](https://github.com/lordquest/app_monitor/blob/main/README.en.md).
 
             | 平台 | 文件 |
             | --- | --- |
