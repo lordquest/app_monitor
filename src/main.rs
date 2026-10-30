@@ -8,6 +8,7 @@ mod i18n;
 mod model;
 mod parse;
 mod provider;
+mod select_text;
 mod store;
 mod ui;
 mod util;

@@ -8,7 +8,9 @@
 //! 非 UI 层（model / store / provider / download / engine / util）与界面无关，
 //! 这里只负责把同一份数据画出来并接住事件。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Instant;
 
 use std::path::PathBuf;
@@ -432,6 +434,8 @@ enum What {
     PageLink,
     Notes,
     AssetLink(String),
+    /// 拖选下来的片段，带字数 —— 回执里说清「复制了多少字」比只说「已复制」有用。
+    Selection(usize),
 }
 
 impl What {
@@ -441,6 +445,7 @@ impl What {
             What::PageLink => "来源页链接".into(),
             What::Notes => "更新说明".into(),
             What::AssetLink(name) => format!("「{name}」的链接"),
+            What::Selection(n) => format!("选中的 {n} 个字"),
         }
     }
 
@@ -450,8 +455,21 @@ impl What {
             What::PageLink => "source page link".into(),
             What::Notes => "release notes".into(),
             What::AssetLink(name) => format!("link to \"{name}\""),
+            What::Selection(n) => format!("selected {n} character(s)"),
         }
     }
+}
+
+/// 一段正文里的选区。
+///
+/// `owner` 区分不同的文本块：概览摘要、更新说明各有一份，切换条目或页签后
+/// 旧的偏移不能再套到新文本上。`text` 存整段原文，用来把字节偏移切成字符串。
+#[derive(Clone)]
+struct Selection {
+    owner: String,
+    anchor: usize,
+    head: usize,
+    text: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -519,6 +537,11 @@ pub struct App {
     /// 窗口标题上一次是按哪种语言设的。切换语言时要在 `render` 里重设一次
     /// （`&mut Window` 只在绘制阶段拿得到），而每帧都设一遍会白打扰系统。
     title_lang: Option<i18n::Lang>,
+    /// 概览正文的选区。GPUI 0.2.2 没有文本选中，这是自己实现的那一份。
+    sel: Option<Selection>,
+    /// 最近一帧画出来的正文 bounds。鼠标事件挂在 div 上，拿不到元素自己的位置，
+    /// 只能靠绘制阶段回填一次。
+    sel_geom: Rc<RefCell<Option<Bounds<Pixels>>>>,
 }
 
 impl App {
@@ -528,7 +551,8 @@ impl App {
         // 环境变量优先，方便截图与排障时临时切换，不去动 config.json。
         let lang = std::env::var("AM_LANG")
             .map(|v| i18n::Lang::from_code(&v))
-            .unwrap_or_else(|_| i18n::Lang::from_code(&store.config.lang));
+            // 配置里没写过语言（空串）就跟随系统，见 i18n::Lang::resolve。
+            .unwrap_or_else(|_| i18n::Lang::resolve(&store.config.lang));
         i18n::set(lang);
         set_ui_scale(
             std::env::var("AM_UI_SCALE")
@@ -601,6 +625,8 @@ impl App {
             confirm_delete: None,
             last_auto: Instant::now(),
             title_lang: None,
+            sel: None,
+            sel_geom: Rc::new(RefCell::new(None)),
         };
         app.spawn_pump(cx);
         if auto {
@@ -1314,14 +1340,134 @@ impl App {
         self.toast(msg, cx);
     }
 
-    /// 切界面语言。立刻生效并落盘 —— 语言没有「取消」这种半程状态。
-    fn set_lang(&mut self, lang: i18n::Lang, cx: &mut Context<Self>) {
-        if i18n::current() == lang {
+    /// 一段可以拖选的正文。
+    ///
+    /// `owner` 必须唯一标识这块文本（带上条目与页签），否则换了条目之后旧选区
+    /// 的字节偏移会套到新文本上。高亮由 `select_text` 自己画，鼠标事件挂在这层
+    /// div 上 —— bounds 从绘制阶段回填的 `sel_geom` 里取。
+    fn selectable_body(
+        &self,
+        owner: String,
+        text: &str,
+        width: Pixels,
+        font_size: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let prep = crate::select_text::prepare(
+            text,
+            width,
+            font_size,
+            font_size * 1.45,
+            ui_font(),
+            rgb(TEXT).into(),
+            window,
+        );
+        let sel = self
+            .sel
+            .as_ref()
+            .filter(|s| s.owner == owner)
+            .map(|s| (s.anchor, s.head));
+        let hit_down = self.sel_geom.clone();
+        let hit_move = self.sel_geom.clone();
+        let down = prep.clone();
+        let drag = prep.clone();
+        let owner_press = owner.clone();
+        let text_press = text.to_string();
+        div()
+            .id(SharedString::from(format!("sel:{owner}")))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                    let Some(bounds) = *hit_down.borrow() else {
+                        return;
+                    };
+                    let at = down.index_at(ev.position - bounds.origin);
+                    this.select_start(owner_press.clone(), at, text_press.clone(), cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _, cx| {
+                // 只有按住键拖动才扩选；单纯悬停不动选区。
+                if ev.pressed_button.is_none() {
+                    return;
+                }
+                let Some(bounds) = *hit_move.borrow() else {
+                    return;
+                };
+                this.select_drag(drag.index_at(ev.position - bounds.origin), cx);
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.select_finish(cx)),
+            )
+            .child(crate::select_text::paint(
+                prep,
+                sel,
+                self.sel_geom.clone(),
+            ))
+            .into_any_element()
+    }
+
+    fn select_start(&mut self, owner: String, at: usize, text: String, cx: &mut Context<Self>) {
+        self.sel = Some(Selection {
+            owner,
+            anchor: at,
+            head: at,
+            text,
+        });
+        cx.notify();
+    }
+
+    fn select_drag(&mut self, at: usize, cx: &mut Context<Self>) {
+        if let Some(sel) = self.sel.as_mut() {
+            if sel.head != at {
+                sel.head = at;
+                cx.notify();
+            }
+        }
+    }
+
+    /// 松手即复制。
+    ///
+    /// 不用 Ctrl+C：GPUI 的按键要走焦点与 action，还得跟输入框抢这个快捷键，
+    /// 而这段文字的唯一用途就是被带走 —— 拖完直接进剪贴板，回执里报字数。
+    fn select_finish(&mut self, cx: &mut Context<Self>) {
+        let Some(sel) = self.sel.as_ref() else {
+            return;
+        };
+        let a = crate::select_text::snap_to_char(&sel.text, sel.anchor.min(sel.head));
+        let b = crate::select_text::snap_to_char(&sel.text, sel.anchor.max(sel.head));
+        if a >= b {
             return;
         }
+        let picked = sel.text.get(a..b).unwrap_or("").trim().to_string();
+        if picked.is_empty() {
+            return;
+        }
+        let n = picked.chars().count();
+        self.copy(picked, What::Selection(n), cx);
+    }
+
+    /// 切界面语言。立刻生效并落盘 —— 语言没有「取消」这种半程状态。
+    fn set_lang(&mut self, lang: i18n::Lang, cx: &mut Context<Self>) {
+        self.apply_lang(lang, lang.code().to_string(), cx);
+    }
+
+    /// 回到「跟随系统」：配置里留空，下次启动重新检测。
+    fn set_lang_auto(&mut self, cx: &mut Context<Self>) {
+        let lang = i18n::Lang::resolve("");
+        self.apply_lang(lang, String::new(), cx);
+    }
+
+    /// `stored` 与生效值是两回事：跟随系统时前者为空、后者是检测结果，
+    /// 所以不能拿 `current()` 是否变化来判断要不要写盘。
+    fn apply_lang(&mut self, lang: i18n::Lang, stored: String, cx: &mut Context<Self>) {
+        let changed = self.cfg.lang != stored || i18n::current() != lang;
+        self.cfg.lang = stored;
         i18n::set(lang);
-        self.cfg.lang = lang.code().to_string();
-        crate::store::write_config(&self.cfg);
+        if changed {
+            crate::store::write_config(&self.cfg);
+        }
         cx.notify();
     }
 
@@ -1433,6 +1579,41 @@ impl App {
                     this.focus_field(FieldId::AddInput, cx);
                 }),
             ))
+            .child(self.lang_switch(cx))
+    }
+
+    /// 顶栏最右侧的语言切换：`中 | EN` 两个小格。
+    ///
+    /// 放在最外层而不是只藏在设置里，是因为「界面是外语，我找不到改语言的地方」
+    /// 是个死胡同 —— 用户不认识那些字，自然也猜不到哪颗按钮通向设置。
+    fn lang_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cur = i18n::current();
+        let seg = |id: &'static str, want: i18n::Lang| {
+            let active = cur == want;
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .px_2()
+                .py_1()
+                .text_size(sp(12.))
+                .text_color(rgb(if active { 0xFFFFFF } else { MUTED }))
+                .bg(rgb(if active { ACCENT } else { 0xFFFFFF }))
+                .cursor_pointer()
+                .when(!active, |d| d.hover(|s| s.bg(rgb(0xF2F4F8))))
+                .child(want.short())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_lang(want, cx)))
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .rounded_md()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(seg("lang-zh", i18n::Lang::Zh))
+            .child(seg("lang-en", i18n::Lang::En))
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1585,7 +1766,12 @@ impl App {
             )
     }
 
-    fn main_panel(&self, text_w: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
+    fn main_panel(
+        &self,
+        text_w: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some(track) = self.track().cloned() else {
             return div()
                 .flex_1()
@@ -1619,7 +1805,7 @@ impl App {
                     .pb_5()
                     .overflow_y_scroll()
                     .child(match view.as_ref() {
-                        Some(r) => self.release_card(&track, r, sel, text_w, cx),
+                        Some(r) => self.release_card(&track, r, sel, text_w, window, cx),
                         None => self.empty_card(&track),
                     })
                     .when(self.tab == Tab::Overview, |d| {
@@ -1678,7 +1864,15 @@ impl App {
                                                 })),
                                             ),
                                     )
-                                    .child(notes_card(&notes, text_w)),
+                                    // 全文比概览更长，这里更该能逐段挑着复制。
+                                    .child(self.selectable_body(
+                                        format!("notes:{tid}"),
+                                        &notes,
+                                        text_w,
+                                        sp(14.),
+                                        window,
+                                        cx,
+                                    )),
                             )
                         },
                     )
@@ -2111,6 +2305,7 @@ impl App {
         r: &Release,
         sel: usize,
         text_w: Pixels,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let url = r.page_url.clone();
@@ -2236,16 +2431,17 @@ impl App {
                         .w_full()
                         .min_w_0()
                         .gap_1()
-                        .child(
-                            div()
-                                // 给确定宽度，否则 taffy 会用 min-content 宽度量高度：
-                                // 换行看着是对的，但卡片底部会多出一大块空白。
-                                .w(text_w)
-                                .text_size(sp(14.))
-                                .text_color(rgb(TEXT))
-                                .whitespace_normal()
-                                .child(shown),
-                        )
+                        // 这段是概览的主体，也是唯一值得逐字复制的部分 —— 做成
+                        // 可拖选。给确定宽度，否则 taffy 会用 min-content 宽度量高度：
+                        // 换行看着是对的，但卡片底部会多出一大块空白。
+                        .child(self.selectable_body(
+                            format!("summary:{}:{sel}", track.id),
+                            &shown,
+                            text_w,
+                            sp(14.),
+                            window,
+                            cx,
+                        ))
                         .when(compact && full.chars().count() > 260, |d| {
                             // 放在 flex_row 里，否则列方向的 stretch 会把这颗胶囊拉成整行。
                             d.child(
@@ -2335,12 +2531,7 @@ impl Render for App {
         let vw: f32 = window.viewport_size().width.into();
         let vh: f32 = window.viewport_size().height.into();
         let text_width = px((vw - 370. * scale()).max(240.));
-        // 英文界面用 Segoe UI 更地道；中文继续用雅黑，字形与字重都按它在调。
-        let font = if i18n::is_en() && cfg!(windows) {
-            "Segoe UI"
-        } else {
-            "Microsoft YaHei UI"
-        };
+        let font = ui_font();
         let toast = self.toast.clone();
         div()
             .flex()
@@ -2513,7 +2704,7 @@ impl Render for App {
                     .flex_1()
                     .overflow_hidden()
                     .child(self.sidebar(cx))
-                    .child(self.main_panel(text_width, cx)),
+                    .child(self.main_panel(text_width, window, cx)),
             )
             .child(self.queue_panel(cx))
             // toast 要排在弹窗**之前**：它是整行一条，画在弹窗后面时会把
@@ -2561,6 +2752,15 @@ fn fallback_text(f: crate::store::Fallback) -> String {
         Fallback::DefaultConfig => "default settings".to_string(),
         Fallback::DefaultTracks => "the built-in list".to_string(),
         Fallback::EmptyHistory => "an empty history".to_string(),
+    }
+}
+
+/// 界面字体：英文用 Segoe UI（更地道），中文继续用雅黑（字形与字重按它在调）。
+fn ui_font() -> &'static str {
+    if i18n::is_en() && cfg!(windows) {
+        "Segoe UI"
+    } else {
+        "Microsoft YaHei UI"
     }
 }
 
@@ -2959,9 +3159,19 @@ impl App {
         // 显示生效值而不是配置值：`AM_UI_SCALE` 这类临时覆盖下两者会不一致。
         let ui_scale = scale();
         // 语言按钮：点了立刻生效，不像别的设置那样要按「保存」—— 换错语言之后
-        // 弹窗里的字已经变了，得能马上切回来。
-        let lang_btn = |id: &'static str, want: i18n::Lang, cx: &mut Context<Self>| {
-            let active = i18n::current() == want;
+        // 弹窗里的字已经变了，得能马上切回来。三态：中文 / English / 跟随系统。
+        let lang_btn = |id: &'static str, want: Option<i18n::Lang>, cx: &mut Context<Self>| {
+            let following = self.cfg.lang.trim().is_empty();
+            let active = match want {
+                // 跟随系统时也不额外高亮实际语言，否则两颗按钮一起亮，看不出
+                // 「现在到底是选的还是跟着系统走的」。
+                Some(w) => !following && i18n::current() == w,
+                None => following,
+            };
+            let text = match want {
+                Some(w) => w.label(),
+                None => t("跟随系统", "System"),
+            };
             div()
                 .id(id)
                 .px_3()
@@ -2971,8 +3181,11 @@ impl App {
                 .text_size(sp(13.))
                 .text_color(rgb(if active { ACCENT } else { TEXT }))
                 .cursor_pointer()
-                .child(want.label())
-                .on_click(cx.listener(move |this, _, _, cx| this.set_lang(want, cx)))
+                .child(text)
+                .on_click(cx.listener(move |this, _, _, cx| match want {
+                    Some(w) => this.set_lang(w, cx),
+                    None => this.set_lang_auto(cx),
+                }))
         };
 
         let dir_row = div()
@@ -3111,8 +3324,9 @@ impl App {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(lang_btn("btn-lang-zh", i18n::Lang::Zh, cx))
-                    .child(lang_btn("btn-lang-en", i18n::Lang::En, cx)),
+                    .child(lang_btn("btn-lang-zh", Some(i18n::Lang::Zh), cx))
+                    .child(lang_btn("btn-lang-en", Some(i18n::Lang::En), cx))
+                    .child(lang_btn("btn-lang-auto", None, cx)),
             )
             .child(label(t(
                 "界面缩放（高 DPI 屏上嫌字小就调大）",
@@ -3488,28 +3702,6 @@ impl App {
                     )
             }))
     }
-}
-
-fn notes_card(notes: &str, text_w: Pixels) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .min_w_0()
-        .p_5()
-        .rounded_lg()
-        .bg(rgb(CARD))
-        .border_1()
-        .border_color(rgb(BORDER))
-        .child(
-            div()
-                .w(text_w)
-                .text_size(sp(14.))
-                .line_height(sp(22.))
-                .text_color(rgb(TEXT))
-                .whitespace_normal()
-                .child(notes.to_string()),
-        )
 }
 
 fn history_card(hist: &[crate::model::VersionEntry]) -> impl IntoElement {

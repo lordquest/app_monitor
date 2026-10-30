@@ -256,7 +256,11 @@ pub struct Config {
     /// 一点：11 逻辑像素在 4K 屏上照样小，用户得能自己调。
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
-    /// 界面语言，`zh` / `en`。空串与未知值都按中文处理。
+    /// 界面语言，`zh` / `en`。
+    ///
+    /// 空串（也就是从没选过）= 跟随操作系统语言，启动时检测一次。之所以不把
+    /// 检测结果写回文件，是因为用户可能只是临时换了系统语言，配置里留空才能
+    /// 每次都跟着系统走。
     #[serde(default = "default_lang")]
     pub lang: String,
 }
@@ -266,7 +270,8 @@ fn default_ui_scale() -> f32 {
 }
 
 fn default_lang() -> String {
-    "zh".to_string()
+    // 空串 = 跟随系统。旧配置里写死的 `zh` 仍然照旧生效。
+    String::new()
 }
 
 impl Default for Config {
