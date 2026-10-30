@@ -135,6 +135,17 @@ impl DlTask {
     }
 }
 
+/// 鼠标停在「正在下载」的侧栏条目上时浮出的详情。
+///
+/// 只记**打开那一刻鼠标的纵向位置**（横向固定贴侧栏右沿），之后鼠标在这条里移动
+/// 不再重算 —— 悬停时每动一像素就改一次状态会让整窗重绘，而浮层本来就不该跟着
+/// 手抖。
+struct DlPop {
+    /// 追踪项的 id，用来确认浮层对应的任务还在。
+    track: String,
+    y: f32,
+}
+
 fn status_color(s: TaskStatus) -> u32 {
     match s {
         TaskStatus::Running => ACCENT,
@@ -572,9 +583,11 @@ pub struct App {
     /// 最近一帧画出来的正文 bounds。鼠标事件挂在 div 上，拿不到元素自己的位置，
     /// 只能靠绘制阶段回填一次。
     sel_geom: Rc<RefCell<Option<Bounds<Pixels>>>>,
-    /// 队列展开状态。`None` = 自动：有任务在跑就展开看进度，全部结束就收成一行；
-    /// `Some` = 用户手动指定过，保持不动（点一次收起，不该被下一帧又弹开）。
-    queue_open: Option<bool>,
+    /// 底部下载面板是否展开。默认收起：下载中的条目在左侧列表里自带一条进度条，
+    /// 想看成败明细、暂停/取消/打开这些操作时才从顶栏点开。
+    queue_show: bool,
+    /// 悬停浮出的下载详情，见 [`DlPop`]。
+    dl_pop: Option<DlPop>,
     /// 选区上右键弹出的菜单。松手即复制之外再给一条显式路径：用户习惯先选中、
     /// 再右键点「复制」，缺了它就会被当成「这个界面不能复制」。
     ctx: Option<CtxMenu>,
@@ -664,7 +677,8 @@ impl App {
             sel: None,
             sel_geom: Rc::new(RefCell::new(None)),
             ctx: None,
-            queue_open: None,
+            queue_show: false,
+            dl_pop: None,
         };
         app.spawn_pump(cx);
         if auto {
@@ -695,7 +709,54 @@ impl App {
                 app.start_asset(&id, &version, &asset, &page, cx);
             }
         }
+        // 排障钩子（同 `AM_GPUI_DEMO_DL`）：塞一条**假的**进行中任务，用来在
+        // 不真的下一遍文件的前提下看侧栏进度条和悬停详情的排版。只活在内存里，
+        // 不发请求、不写历史。
+        if std::env::var("AM_GPUI_FAKE_DL").is_ok() {
+            app.fake_task(0.42);
+        }
         app
+    }
+
+    /// 造一条进行中的假任务，见 `new` 里的 `AM_GPUI_FAKE_DL`。
+    fn fake_task(&mut self, frac: f32) {
+        let Some(track) = self.tracks.first() else {
+            return;
+        };
+        // 文件名和版本跟真实数据对齐，截图才不会被「deepxcode-1.2.3」这种编出来的
+        // 名字暴露；没有解析结果时退回到一个通用名字。
+        let release = track.release.clone();
+        let version = release
+            .as_ref()
+            .map(|r| r.version.clone())
+            .unwrap_or_else(|| "v1.0.0".to_string());
+        let file = release
+            .as_ref()
+            .and_then(|r| {
+                r.assets
+                    .iter()
+                    .find(|a| a.kind == AssetKind::Direct)
+                    .map(|a| a.name.clone())
+            })
+            .unwrap_or_else(|| format!("{}-{}-x86_64.AppImage", track.name, version));
+        let spec = DlSpec {
+            id: "fake-dl".to_string(),
+            track_id: track.id.clone(),
+            app: track.name.clone(),
+            version,
+            file,
+            url: String::new(),
+            dir: std::path::PathBuf::new(),
+            sha256: None,
+            referer: None,
+        };
+        let total = 48_000_000u64;
+        let mut task = DlTask::new(spec);
+        task.status = TaskStatus::Running;
+        task.total = total;
+        task.downloaded = (total as f64 * frac as f64) as u64;
+        task.speed = 2.4 * 1024.0 * 1024.0;
+        self.tasks.insert(0, task);
     }
 
     /// 后台消息泵：engine 用 std::sync::mpsc 回传解析/下载结果，这里每 150ms
@@ -939,8 +1000,10 @@ impl App {
         else {
             return;
         };
-        // 回到「自动」：有任务在跑就展开，否则用户点了「下载」看不到进度。
-        self.queue_open = None;
+        // 不再自动展开底部面板：进度改在左侧列表那条上显示，面板由顶栏的
+        // 「下载队列」自己开关。这里只是把上一次的悬停浮层收掉，免得它留在
+        // 上一个任务的位置上。
+        self.dl_pop = None;
         if asset.kind != AssetKind::Direct {
             let is_http = asset.url.starts_with("http://") || asset.url.starts_with("https://");
             if is_http {
@@ -1075,6 +1138,11 @@ impl App {
         self.tasks.retain(|t| {
             matches!(t.status, TaskStatus::Running | TaskStatus::Queued | TaskStatus::Paused)
         });
+        // 队列被清空时顺手收起：否则下一次下载会让这个空面板自己又弹出来，
+        // 而用户上次是主动关掉它的。
+        if self.tasks.is_empty() {
+            self.queue_show = false;
+        }
         cx.notify();
     }
 
@@ -1710,6 +1778,114 @@ impl App {
             .into_any_element()
     }
 
+    /// 侧栏「正在下载」那条上悬停时浮出的详情卡。
+    ///
+    /// 卡片不能画在行里：列表是滚动容器，超出侧栏宽度的部分会被裁掉。所以和
+    /// 右键菜单同一套做法 —— 挂在根节点上绝对定位，横向贴侧栏右沿、纵向跟着
+    /// 悬停的那一行，再按窗口边缘往里收。
+    fn dl_pop_layer(&self, vw: f32, vh: f32) -> AnyElement {
+        let Some(pop) = self.dl_pop.as_ref() else {
+            return div().into_any_element();
+        };
+        // 任务可能刚在这一帧结束：没有活任务就当作已经散场。
+        let Some(task) = self.live_task(&pop.track) else {
+            return div().into_any_element();
+        };
+        let w = 236. * scale();
+        let h = 96. * scale();
+        // 横坐标贴住侧栏右沿而不是跟着光标：侧栏只有 272 宽，跟着光标画的卡片会
+        // 盖住下面两三条 —— 而那正是用户想拿来对照的邻居。纵坐标跟着行，卡片就
+        // 像是从这一条上「抽」出来的。
+        let x = (272. * scale() + 6.).min((vw - w - 8.).max(8.)).max(8.);
+        let y = (pop.y - 12.).min((vh - h - 8.).max(8.)).max(8.);
+        let pct = (task.frac() * 100.).round() as i32;
+        let size = if task.total == 0 {
+            format!(
+                "{} · {}",
+                util::fmt_bytes(task.downloaded),
+                t("大小未知", "size unknown")
+            )
+        } else {
+            format!(
+                "{} / {} · {pct}%",
+                util::fmt_bytes(task.downloaded),
+                util::fmt_bytes(task.total)
+            )
+        };
+        // 速度只在真的在跑时有意义。暂停/排队时这一格留空，右边的状态已经说明
+        // 了一切换，再写一遍「已暂停 已暂停」只是重复。
+        let rate = (task.status == TaskStatus::Running)
+            .then(|| format!("{} {}", t("速度", "Speed"), util::fmt_speed(task.speed)));
+
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(w))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            // 卡片会压在白底详情页上，靠这条边框把边界交代清楚。
+            .child(
+                div()
+                    .text_size(sp(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .text_ellipsis()
+                    .child(format!("{} · {}", task.spec.app, task.spec.file)),
+            )
+            .child(
+                div()
+                    .text_size(sp(12.))
+                    .text_color(rgb(MUTED))
+                    .child(size),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .when_some(rate, |d, rate| {
+                        d.child(
+                            div()
+                                .text_size(sp(12.))
+                                .text_color(rgb(status_color(task.status)))
+                                .child(rate),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(sp(11.5))
+                            .text_color(rgb(FAINT))
+                            .child(task.status.label()),
+                    ),
+            )
+            // 卡片里也放一条进度条：数字之外，比例本身最直观。
+            .child(
+                div()
+                    .h(px(3.))
+                    .w_full()
+                    .rounded_full()
+                    .bg(rgb(0xDDE3EE))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(task.frac()))
+                            .rounded_full()
+                            .bg(rgb(status_color(task.status))),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 切界面语言。立刻生效并落盘 —— 语言没有「取消」这种半程状态。
     fn set_lang(&mut self, lang: i18n::Lang, cx: &mut Context<Self>) {
         self.apply_lang(lang, lang.code().to_string(), cx);
@@ -1847,6 +2023,33 @@ impl App {
                         }),
                 )
             })
+            // 下载队列的开关。队列默认收在底部之外，它的入口就放在「检查全部
+            // 更新」左边：用户想看下载在哪儿，第一眼扫的是这一排按钮。
+            .when(!self.tasks.is_empty(), |d| {
+                let active = self.active_count();
+                let open = self.queue_show;
+                d.child(
+                    chip(
+                        "btn-queue",
+                        if active > 0 {
+                            format!("{} {}", t("下载队列", "Downloads"), active)
+                        } else {
+                            t("下载队列", "Downloads").to_string()
+                        },
+                        if open { ACCENT } else { TEXT },
+                        if open { ACCENT_SOFT } else { 0xF2F4F8 },
+                    )
+                    // 和旁边的「检查全部更新」同一尺寸：这排按钮里突然冒出一颗
+                    // 小一号的胶囊，看上去像是「次要到不用点」。
+                    .px_3()
+                    .py_2()
+                    .text_size(sp(13.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.queue_show = !this.queue_show;
+                        cx.notify();
+                    })),
+                )
+            })
             .child(
                 btn("btn-check", t("检查全部更新", "Check all"), ACCENT, 0xFFFFFF)
                     .on_click(cx.listener(|this, _, _, cx| this.resolve_all(cx))),
@@ -1899,6 +2102,35 @@ impl App {
             .border_color(rgb(BORDER))
             .child(seg("lang-zh", i18n::Lang::Zh))
             .child(seg("lang-en", i18n::Lang::En))
+    }
+
+    /// 某个追踪项当前**还没结束**的下载任务（排队 / 进行中 / 暂停）。
+    ///
+    /// 只看未结束的：已完成的任务在列表里再挂一条满格绿条没有信息量，结果由
+    /// toast 和下载历史交代。任务表是**新的在最前**（`start_asset` 用 `insert(0)`），
+    /// 所以正序 `find` 拿到的就是最新一条。
+    fn live_task(&self, track_id: &str) -> Option<&DlTask> {
+        self.tasks.iter().find(|t| {
+            t.spec.track_id == track_id
+                && matches!(
+                    t.status,
+                    TaskStatus::Running | TaskStatus::Queued | TaskStatus::Paused
+                )
+        })
+    }
+
+    /// 还在跑的任务数（排队、进行中、暂停都算「没结束」）。顶栏按钮的角标和
+    /// 队列标题都用它。
+    fn active_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Running | TaskStatus::Queued | TaskStatus::Paused
+                )
+            })
+            .count()
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2013,6 +2245,9 @@ impl App {
                                 let is_sel = selected.as_deref() == Some(t.id.as_str());
                                 let (sub, color) = track_status(t);
                                 let t_id = t.id.clone();
+                                let live = self.live_task(&t.id);
+                                let downloading = live.is_some();
+                                let pop_id = t.id.clone();
                                 div()
                                     .id(SharedString::from(format!("row-{}", t.id)))
                                     .flex()
@@ -2036,13 +2271,73 @@ impl App {
                                             .text_ellipsis()
                                             .child(t.name.clone()),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(sp(12.))
-                                            .text_color(rgb(color))
-                                            .text_ellipsis()
-                                            .child(sub),
-                                    )
+                                    // 第二行平时是版本/状态文字。有下载在跑时换成一条
+                                    // 细进度条 —— 列表里只需要一眼看出「这条在动」，
+                                    // 已下载多少、多快放到悬停浮层里说，不然每行都要
+                                    // 塞两行数字，列表会变成一块仪表盘。
+                                    .when_some(live, |d, task| {
+                                        let frac = task.frac();
+                                        let fill = status_color(task.status);
+                                        d.child(
+                                            div()
+                                                .h(px(3.))
+                                                .w_full()
+                                                .rounded_full()
+                                                // 比侧栏底色深一档，0% 也看得见轨道
+                                                .bg(rgb(0xDDE3EE))
+                                                .child(
+                                                    div()
+                                                        .h_full()
+                                                        .w(relative(frac))
+                                                        .rounded_full()
+                                                        .bg(rgb(fill)),
+                                                ),
+                                        )
+                                    })
+                                    .when(!downloading, |d| {
+                                        d.child(
+                                            div()
+                                                .text_size(sp(12.))
+                                                .text_color(rgb(color))
+                                                .text_ellipsis()
+                                                .child(sub),
+                                        )
+                                    })
+                                    .when(downloading, |d| {
+                                        let ent = cx.entity();
+                                        d.on_mouse_move(cx.listener(
+                                            move |this, ev: &gpui::MouseMoveEvent, _, cx| {
+                                                // 同一条上继续移动不再重设：位置一样却
+                                                // 每像素通知一次，等于整窗每秒重绘几十遍。
+                                                if this
+                                                    .dl_pop
+                                                    .as_ref()
+                                                    .is_some_and(|p| p.track == pop_id)
+                                                {
+                                                    return;
+                                                }
+                                                this.dl_pop = Some(DlPop {
+                                                    track: pop_id.clone(),
+                                                    y: ev.position.y.into(),
+                                                });
+                                                cx.notify();
+                                            },
+                                        ))
+                                        // 离开这条必须靠 hover 的结束事件：`on_mouse_move`
+                                        // 只在鼠标还在元素上时触发，移出去以后一次都不会
+                                        // 再来，浮层就会一直挂在那儿。
+                                        .on_hover(move |hovered: &bool, _, app| {
+                                            if *hovered {
+                                                return;
+                                            }
+                                            ent.update(app, |this, cx| {
+                                                if this.dl_pop.is_some() {
+                                                    this.dl_pop = None;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        })
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.select(&t_id, cx)
                                     }))
@@ -2184,14 +2479,12 @@ impl App {
     /// 展开时主内容区跟着变矮并出现滚动条，收起来只剩一行标题。
     /// 之前这里无上限地长高，把页面下半截挤出去，看着就像被盖住了。
     fn queue_panel(&self, vh: f32, cx: &mut Context<Self>) -> AnyElement {
-        if self.tasks.is_empty() {
+        // 面板本身不再自己决定开合：开关在顶栏那颗「下载队列」上，这里只管画。
+        // 收起时返回空元素，底部一行都不占。
+        if self.tasks.is_empty() || !self.queue_show {
             return div().into_any_element();
         }
-        let running = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Queued | TaskStatus::Paused))
-            .count();
+        let running = self.active_count();
         let finished = self
             .tasks
             .iter()
@@ -2202,7 +2495,6 @@ impl App {
                 )
             })
             .count();
-        let open = self.queue_open.unwrap_or(running > 0);
 
         // 标题行固定一行高：收起状态下整个队列就只占这一行，
         // 不让它跟着任务数量一起往上长。
@@ -2249,25 +2541,18 @@ impl App {
             .when(finished > 0, |d| {
                 d.child(
                     chip("btn-clear", t("清空已结束", "Clear finished"), MUTED, 0xF2F4F8)
-                        .when(!open, |d| d)
                         .on_click(cx.listener(|this, _, _, cx| this.clear_finished(cx))),
                 )
             })
+            // 顶栏那颗按钮已经能收起，这里再留一个同样的出口：面板摊在最底下时
+            // 手边的「收起」比回到顶栏去找按钮少一次视线转移。
             .child(
-                chip(
-                    "queue-toggle",
-                    if open {
-                        t("收起", "Hide")
-                    } else {
-                        t("展开", "Show")
-                    },
-                    if open { MUTED } else { ACCENT },
-                    if open { 0xF2F4F8 } else { ACCENT_SOFT },
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.queue_open = Some(!open);
-                    cx.notify();
-                })),
+                chip("queue-toggle", t("收起", "Hide"), MUTED, 0xF2F4F8).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.queue_show = false;
+                        cx.notify();
+                    }),
+                ),
             );
 
         div()
@@ -2277,22 +2562,21 @@ impl App {
             .border_t_1()
             .border_color(rgb(BORDER))
             .child(head)
-            .when(open, |d| {
-                d.child(
-                    div()
-                        .id("queue-list")
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .px_5()
-                        .pb_3()
-                        // 最多占窗口两成高：再多主内容就只剩一条缝了，其余的
-                        // 在这里自己滚。没有这条上限时任务一多会把详情页顶出窗口。
-                        .max_h(px((vh * 0.22).max(110.)))
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .children(self.tasks.iter().take(8).map(|task| {
-                            let id = task.spec.id.clone();
+            .child(
+                div()
+                    .id("queue-list")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_5()
+                    .pb_3()
+                    // 最多占窗口三成高：再多主内容就只剩一条缝了，其余的
+                    // 在这里自己滚。没有这条上限时任务一多会把详情页顶出窗口。
+                    .max_h(px((vh * 0.30).max(110.)))
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(self.tasks.iter().take(8).map(|task| {
+                        let id = task.spec.id.clone();
                 let id2 = id.clone();
                 let pause_label = if task.status == TaskStatus::Running {
                     crate::i18n::t("暂停", "Pause")
@@ -2502,7 +2786,6 @@ impl App {
                     })
                         }))
                 )
-            })
             .into_any_element()
     }
 
@@ -3088,6 +3371,8 @@ impl Render for App {
                     .child(self.main_panel(text_width, window, cx)),
             )
             .child(self.queue_panel(vh, cx))
+            // 悬停详情浮层：不参与布局，压在正文之上、弹窗之下。
+            .child(self.dl_pop_layer(vw, vh))
             // toast 是**浮层**：`absolute` 不参与 flex 布局，出现和消失都不会
             // 让页面跳一下，也不会把底部队列往上顶。放顶部居中是刻意的——
             // 底部已经被队列占着，右下角还会压住「暂停 / 取消」这些按钮。
