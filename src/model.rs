@@ -235,6 +235,22 @@ impl Track {
             _ => false,
         }
     }
+
+    /// 把「已看过的版本」推到当前最新版，橙色提示随之消失。返回是否真的变了
+    /// —— 调用方拿它决定要不要写盘，重复点「标为已读」不该触发一次 IO。
+    ///
+    /// 只动 `seen_version`，**不动** `release`：详情页照旧显示这一版，标为已读
+    /// 表示「这个提醒我看过了」，不是「我不关心这个版本」。
+    pub fn mark_seen(&mut self) -> bool {
+        let Some(ver) = self.release.as_ref().map(|r| r.version.clone()) else {
+            return false;
+        };
+        if ver.is_empty() || self.seen_version.as_deref() == Some(ver.as_str()) {
+            return false;
+        }
+        self.seen_version = Some(ver);
+        true
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -358,5 +374,50 @@ pub fn arch_of(name: &str) -> Option<&'static str> {
         Some("x86")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个「已有最新版 v、上次看过 seen」的条目。
+    fn track_with(seen: Option<&str>, latest: &str) -> Track {
+        let mut t = Track::new("demo", "demo", "https://example.com/demo", SourceKind::GitHub, "g", "");
+        if let Some(s) = seen {
+            t.seen_version = Some(s.to_string());
+        }
+        t.release = Some(Release {
+            version: latest.to_string(),
+            ..Default::default()
+        });
+        t
+    }
+
+    #[test]
+    fn update_badge_only_when_version_differs_from_seen() {
+        assert!(track_with(Some("1.0.0"), "2.0.0").has_update());
+        assert!(!track_with(Some("2.0.0"), "2.0.0").has_update());
+        // 从没看过（首次解析前）不算更新，否则启动后满屏橙色。
+        assert!(!track_with(None, "2.0.0").has_update());
+    }
+
+    #[test]
+    fn mark_seen_clears_the_badge_and_is_idempotent() {
+        let mut t = track_with(Some("1.0.0"), "2.0.0");
+        assert!(t.mark_seen());
+        assert!(!t.has_update());
+        assert_eq!(t.seen_version.as_deref(), Some("2.0.0"));
+        // 第二次点「标为已读」不该再返回「变了」——否则会多写一次盘。
+        assert!(!t.mark_seen());
+        // 详情页仍然显示最新这一版，标为已读只是清提醒。
+        assert_eq!(t.release.as_ref().unwrap().version, "2.0.0");
+    }
+
+    #[test]
+    fn mark_seen_on_empty_version_does_nothing() {
+        let mut t = track_with(None, "");
+        assert!(!t.mark_seen());
+        assert_eq!(t.seen_version, None);
     }
 }

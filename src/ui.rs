@@ -879,6 +879,36 @@ impl App {
         self.toast(t("已开始检查全部追踪项", "Checking every tracked item"), cx);
     }
 
+    /// 把一项标为已读：把 `seen_version` 推到当前版本，橙色的「新版本」提示
+    /// 随之消失。**不动** `release` 本身 —— 详情页照旧显示这一版，只是不再
+    /// 催着用户看。用户很可能只是想清掉提醒，不代表他不关心这个版本。
+    fn mark_read(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if t.mark_seen() {
+            crate::store::write_tracks(&self.tracks);
+            cx.notify();
+        }
+    }
+
+    /// 一次清掉所有提醒。返回清掉的条数，0 表示本来就没有。
+    fn mark_all_read(&mut self, cx: &mut Context<Self>) -> usize {
+        let mut n = 0usize;
+        for t in self.tracks.iter_mut() {
+            // 先判 has_update 再 mark_seen：后者本身是幂等的，但多遍历一次
+            // 无更新的条目也没意义。
+            if t.has_update() && t.mark_seen() {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            crate::store::write_tracks(&self.tracks);
+            cx.notify();
+        }
+        n
+    }
+
     fn resolve_one(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.resolving.contains(id) {
             return;
@@ -1780,6 +1810,29 @@ impl App {
                     ORANGE,
                     ORANGE_SOFT,
                 ))
+                // 徽章旁边直接给出口：一次清掉全部提醒，不必挨个点进条目。
+                .child(
+                    chip(
+                        "mark-all-read",
+                        t("全部标为已读", "Mark all read"),
+                        ORANGE,
+                        ORANGE_SOFT,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let n = this.mark_all_read(cx);
+                        this.toast(
+                            if i18n::is_en() {
+                                format!(
+                                    "Marked {n} update{} as read",
+                                    if n == 1 { "" } else { "s" }
+                                )
+                            } else {
+                                format!("已把 {n} 项更新标为已读")
+                            },
+                            cx,
+                        );
+                    })),
+                )
             })
             .child(div().flex_1())
             .when(!self.resolving.is_empty(), |d| {
@@ -2522,6 +2575,18 @@ impl App {
                                 .text_size(sp(13.5))
                                 .text_color(rgb(MUTED))
                                 .child(format!("v{v}")),
+                        )
+                    })
+                    .when(track.has_update(), |d| {
+                        // 「有新版本」这件事本身就该有个收尾动作：没有它，橙色的
+                        // 提示只能等下一次真的出了新版本才变化，用户没法把已看过
+                        // 的版本清掉。
+                        let id = track.id.clone();
+                        d.child(
+                            btn("btn-mark-read", t("标为已读", "Mark read"), ORANGE_SOFT, ORANGE)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mark_read(&id, cx);
+                                })),
                         )
                     })
                     .child({
