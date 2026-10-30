@@ -146,6 +146,35 @@ struct DlPop {
     y: f32,
 }
 
+/// 这条子任务是不是还「没结束」（排队、进行中、暂停都算）。
+fn is_live(s: TaskStatus) -> bool {
+    matches!(s, TaskStatus::Running | TaskStatus::Queued | TaskStatus::Paused)
+}
+
+/// 同一条追踪项下多条任务的**合计**进度与配色。
+///
+/// 一个条目可以同时下好几个文件（比如 Windows 和 Linux 版一起下）。侧栏那一行
+/// 代表的是「这一项」，不是「最后点的那一个」，所以进度要按总字节数合起来算——
+/// 否则列表里的条会随最后一条任务跳动，看着像退回去了。
+fn aggregate(tasks: &[&DlTask]) -> (f32, u32) {
+    let total: u64 = tasks.iter().map(|t| t.total).sum();
+    let done: u64 = tasks.iter().map(|t| t.downloaded).sum();
+    let frac = if total == 0 {
+        0.
+    } else {
+        (done as f64 / total as f64).clamp(0., 1.) as f32
+    };
+    // 有一条在跑就是「进行中」的主色；全暂停给橙色；只剩排队则是灰的。
+    let color = if tasks.iter().any(|t| t.status == TaskStatus::Running) {
+        ACCENT
+    } else if tasks.iter().any(|t| t.status == TaskStatus::Paused) {
+        ORANGE
+    } else {
+        MUTED
+    };
+    (frac, color)
+}
+
 fn status_color(s: TaskStatus) -> u32 {
     match s {
         TaskStatus::Running => ACCENT,
@@ -712,14 +741,16 @@ impl App {
         // 排障钩子（同 `AM_GPUI_DEMO_DL`）：塞一条**假的**进行中任务，用来在
         // 不真的下一遍文件的前提下看侧栏进度条和悬停详情的排版。只活在内存里，
         // 不发请求、不写历史。
-        if std::env::var("AM_GPUI_FAKE_DL").is_ok() {
-            app.fake_task(0.42);
+        if let Ok(v) = std::env::var("AM_GPUI_FAKE_DL") {
+            // 值写成 2 就塞两条（同一个条目下 Windows + Linux 一起下的场面）。
+            let n = v.trim().parse::<usize>().unwrap_or(1).clamp(1, 3);
+            app.fake_tasks(n);
         }
         app
     }
 
-    /// 造一条进行中的假任务，见 `new` 里的 `AM_GPUI_FAKE_DL`。
-    fn fake_task(&mut self, frac: f32) {
+    /// 造 `n` 条进行中的假任务，见 `new` 里的 `AM_GPUI_FAKE_DL`。
+    fn fake_tasks(&mut self, n: usize) {
         let Some(track) = self.tracks.first() else {
             return;
         };
@@ -730,33 +761,42 @@ impl App {
             .as_ref()
             .map(|r| r.version.clone())
             .unwrap_or_else(|| "v1.0.0".to_string());
-        let file = release
+        let direct: Vec<String> = release
             .as_ref()
-            .and_then(|r| {
+            .map(|r| {
                 r.assets
                     .iter()
-                    .find(|a| a.kind == AssetKind::Direct)
+                    .filter(|a| a.kind == AssetKind::Direct)
                     .map(|a| a.name.clone())
+                    .collect()
             })
-            .unwrap_or_else(|| format!("{}-{}-x86_64.AppImage", track.name, version));
-        let spec = DlSpec {
-            id: "fake-dl".to_string(),
-            track_id: track.id.clone(),
-            app: track.name.clone(),
-            version,
-            file,
-            url: String::new(),
-            dir: std::path::PathBuf::new(),
-            sha256: None,
-            referer: None,
-        };
-        let total = 48_000_000u64;
-        let mut task = DlTask::new(spec);
-        task.status = TaskStatus::Running;
-        task.total = total;
-        task.downloaded = (total as f64 * frac as f64) as u64;
-        task.speed = 2.4 * 1024.0 * 1024.0;
-        self.tasks.insert(0, task);
+            .unwrap_or_default();
+        // 进度取三个不一样的值，一眼能看出这是两条独立的下载。
+        for i in 0..n {
+            let file = direct
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("{}-{}-{}.bin", track.name, version, i + 1));
+            let spec = DlSpec {
+                id: format!("fake-dl-{i}"),
+                track_id: track.id.clone(),
+                app: track.name.clone(),
+                version: version.clone(),
+                file,
+                url: String::new(),
+                dir: std::path::PathBuf::new(),
+                sha256: None,
+                referer: None,
+            };
+            let total = 48_000_000u64 + i as u64 * 12_000_000;
+            let frac = [0.42, 0.18, 0.66][i % 3];
+            let mut task = DlTask::new(spec);
+            task.status = TaskStatus::Running;
+            task.total = total;
+            task.downloaded = (total as f64 * frac) as u64;
+            task.speed = 2.4 * 1024.0 * 1024.0 - i as f64 * 600.0 * 1024.0;
+            self.tasks.insert(i, task);
+        }
     }
 
     /// 后台消息泵：engine 用 std::sync::mpsc 回传解析/下载结果，这里每 150ms
@@ -1788,34 +1828,21 @@ impl App {
             return div().into_any_element();
         };
         // 任务可能刚在这一帧结束：没有活任务就当作已经散场。
-        let Some(task) = self.live_task(&pop.track) else {
+        let tasks = self.live_tasks(&pop.track);
+        if tasks.is_empty() {
             return div().into_any_element();
-        };
-        let w = 236. * scale();
-        let h = 96. * scale();
+        }
+        let n = tasks.len();
+        let w = 248. * scale();
+        // 高度按条目数估：标题一行 + 每个任务 3 行（文件名 / 数字 / 进度条）。
+        // 估高只用于贴边翻向，多算几个像素不会露馅，少算才会被窗口底边切掉。
+        let h = (34. + n as f32 * 44.) * scale();
         // 横坐标贴住侧栏右沿而不是跟着光标：侧栏只有 272 宽，跟着光标画的卡片会
         // 盖住下面两三条 —— 而那正是用户想拿来对照的邻居。纵坐标跟着行，卡片就
         // 像是从这一条上「抽」出来的。
         let x = (272. * scale() + 6.).min((vw - w - 8.).max(8.)).max(8.);
         let y = (pop.y - 12.).min((vh - h - 8.).max(8.)).max(8.);
-        let pct = (task.frac() * 100.).round() as i32;
-        let size = if task.total == 0 {
-            format!(
-                "{} · {}",
-                util::fmt_bytes(task.downloaded),
-                t("大小未知", "size unknown")
-            )
-        } else {
-            format!(
-                "{} / {} · {pct}%",
-                util::fmt_bytes(task.downloaded),
-                util::fmt_bytes(task.total)
-            )
-        };
-        // 速度只在真的在跑时有意义。暂停/排队时这一格留空，右边的状态已经说明
-        // 了一切换，再写一遍「已暂停 已暂停」只是重复。
-        let rate = (task.status == TaskStatus::Running)
-            .then(|| format!("{} {}", t("速度", "Speed"), util::fmt_speed(task.speed)));
+        let app = tasks[0].spec.app.clone();
 
         div()
             .absolute()
@@ -1824,65 +1851,114 @@ impl App {
             .w(px(w))
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_2()
             .px_3()
             .py_2()
             .rounded_lg()
             .bg(rgb(CARD))
             .border_1()
             .border_color(rgb(BORDER))
-            // 卡片会压在白底详情页上，靠这条边框把边界交代清楚。
-            .child(
-                div()
-                    .text_size(sp(12.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
-                    .text_ellipsis()
-                    .child(format!("{} · {}", task.spec.app, task.spec.file)),
-            )
-            .child(
-                div()
-                    .text_size(sp(12.))
-                    .text_color(rgb(MUTED))
-                    .child(size),
-            )
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .when_some(rate, |d, rate| {
+                    .child(
+                        div()
+                            .text_size(sp(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .text_ellipsis()
+                            .child(app),
+                    )
+                    .child(div().flex_1())
+                    // 一条目同时下多个文件时，必须先说明「下面有几条」，否则会被
+                    // 当成同一个文件刷了两遍进度。
+                    .when(n > 1, |d| {
                         d.child(
                             div()
-                                .text_size(sp(12.))
-                                .text_color(rgb(status_color(task.status)))
-                                .child(rate),
+                                .text_size(sp(11.5))
+                                .text_color(rgb(ACCENT))
+                                .child(if i18n::is_en() {
+                                    format!("{n} files")
+                                } else {
+                                    format!("{n} 个文件")
+                                }),
                         )
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(sp(11.5))
-                            .text_color(rgb(FAINT))
-                            .child(task.status.label()),
-                    ),
+                    }),
             )
-            // 卡片里也放一条进度条：数字之外，比例本身最直观。
-            .child(
+            .children(tasks.into_iter().map(|task| {
+                let pct = (task.frac() * 100.).round() as i32;
+                let size = if task.total == 0 {
+                    format!(
+                        "{} · {}",
+                        util::fmt_bytes(task.downloaded),
+                        t("大小未知", "size unknown")
+                    )
+                } else {
+                    format!(
+                        "{} / {} · {pct}%",
+                        util::fmt_bytes(task.downloaded),
+                        util::fmt_bytes(task.total)
+                    )
+                };
+                // 速度只在真的在跑、而且已经有测速结果时才有意义；刚起步那一两帧
+                // 速度还是 0，此时显示「下载中」比一个「—」更像话。
+                let right = if task.status == TaskStatus::Running && task.speed > 0. {
+                    util::fmt_speed(task.speed)
+                } else {
+                    task.status.label().to_string()
+                };
                 div()
-                    .h(px(3.))
-                    .w_full()
-                    .rounded_full()
-                    .bg(rgb(0xDDE3EE))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
                     .child(
                         div()
-                            .h_full()
-                            .w(relative(task.frac()))
+                            .text_size(sp(12.))
+                            .text_color(rgb(TEXT))
+                            .text_ellipsis()
+                            .child(task.spec.file.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(sp(11.5))
+                                    .text_color(rgb(MUTED))
+                                    .text_ellipsis()
+                                    .min_w_0()
+                                    .child(size),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(sp(11.5))
+                                    .text_color(rgb(status_color(task.status)))
+                                    .child(right),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(3.))
+                            .w_full()
                             .rounded_full()
-                            .bg(rgb(status_color(task.status))),
-                    ),
-            )
+                            .bg(rgb(0xDDE3EE))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(task.frac()))
+                                    .rounded_full()
+                                    .bg(rgb(status_color(task.status))),
+                            ),
+                    )
+            }))
             .into_any_element()
     }
 
@@ -2104,19 +2180,16 @@ impl App {
             .child(seg("lang-en", i18n::Lang::En))
     }
 
-    /// 某个追踪项当前**还没结束**的下载任务（排队 / 进行中 / 暂停）。
+    /// 某个追踪项当前**还没结束**的下载任务（排队 / 进行中 / 暂停），新的在前。
     ///
     /// 只看未结束的：已完成的任务在列表里再挂一条满格绿条没有信息量，结果由
-    /// toast 和下载历史交代。任务表是**新的在最前**（`start_asset` 用 `insert(0)`），
-    /// 所以正序 `find` 拿到的就是最新一条。
-    fn live_task(&self, track_id: &str) -> Option<&DlTask> {
-        self.tasks.iter().find(|t| {
-            t.spec.track_id == track_id
-                && matches!(
-                    t.status,
-                    TaskStatus::Running | TaskStatus::Queued | TaskStatus::Paused
-                )
-        })
+    /// toast 和下载历史交代。同一个条目可能同时下好几个文件（Windows 版 +
+    /// Linux 版），所以这里返回列表，侧栏与悬停浮层都按整组来算。
+    fn live_tasks(&self, track_id: &str) -> Vec<&DlTask> {
+        self.tasks
+            .iter()
+            .filter(|t| t.spec.track_id == track_id && is_live(t.status))
+            .collect()
     }
 
     /// 还在跑的任务数（排队、进行中、暂停都算「没结束」）。顶栏按钮的角标和
@@ -2245,8 +2318,11 @@ impl App {
                                 let is_sel = selected.as_deref() == Some(t.id.as_str());
                                 let (sub, color) = track_status(t);
                                 let t_id = t.id.clone();
-                                let live = self.live_task(&t.id);
-                                let downloading = live.is_some();
+                                let live = self.live_tasks(&t.id);
+                                let downloading = !live.is_empty();
+                                // 同时下多个文件时，表里这一条按合计进度画：它代表的
+                                // 是「这一项」，不是「最后点的那一个」。
+                                let agg = downloading.then(|| aggregate(&live));
                                 let pop_id = t.id.clone();
                                 div()
                                     .id(SharedString::from(format!("row-{}", t.id)))
@@ -2275,9 +2351,7 @@ impl App {
                                     // 细进度条 —— 列表里只需要一眼看出「这条在动」，
                                     // 已下载多少、多快放到悬停浮层里说，不然每行都要
                                     // 塞两行数字，列表会变成一块仪表盘。
-                                    .when_some(live, |d, task| {
-                                        let frac = task.frac();
-                                        let fill = status_color(task.status);
+                                    .when_some(agg, |d, (frac, fill)| {
                                         d.child(
                                             div()
                                                 .h(px(3.))
