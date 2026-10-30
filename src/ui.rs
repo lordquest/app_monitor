@@ -572,6 +572,9 @@ pub struct App {
     /// 最近一帧画出来的正文 bounds。鼠标事件挂在 div 上，拿不到元素自己的位置，
     /// 只能靠绘制阶段回填一次。
     sel_geom: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// 队列展开状态。`None` = 自动：有任务在跑就展开看进度，全部结束就收成一行；
+    /// `Some` = 用户手动指定过，保持不动（点一次收起，不该被下一帧又弹开）。
+    queue_open: Option<bool>,
     /// 选区上右键弹出的菜单。松手即复制之外再给一条显式路径：用户习惯先选中、
     /// 再右键点「复制」，缺了它就会被当成「这个界面不能复制」。
     ctx: Option<CtxMenu>,
@@ -661,6 +664,7 @@ impl App {
             sel: None,
             sel_geom: Rc::new(RefCell::new(None)),
             ctx: None,
+            queue_open: None,
         };
         app.spawn_pump(cx);
         if auto {
@@ -905,6 +909,8 @@ impl App {
         else {
             return;
         };
+        // 回到「自动」：有任务在跑就展开，否则用户点了「下载」看不到进度。
+        self.queue_open = None;
         if asset.kind != AssetKind::Direct {
             let is_http = asset.url.starts_with("http://") || asset.url.starts_with("https://");
             if is_http {
@@ -1350,7 +1356,26 @@ impl App {
     }
 
     fn toast(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
-        self.toast = Some((msg.into(), Instant::now()));
+        let stamp = Instant::now();
+        self.toast = Some((msg.into(), stamp));
+        // 4 秒后自己消失。没有下载在跑时界面不会周期性重绘，光靠渲染时过滤
+        // `elapsed < 4s` 这条消息会一直挂在屏幕上。这里补一个定时器触发重绘；
+        // 期间用户又点了一次，`stamp` 就对不上，旧定时器自然什么也不做。
+        cx.spawn(move |this: gpui::WeakEntity<App>, cx: &mut gpui::AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                cx.background_executor()
+                    .timer(Duration::from_millis(4200))
+                    .await;
+                let _ = this.update(&mut cx, |this, cx| {
+                    if this.toast.as_ref().map(|(_, at)| *at) == Some(stamp) {
+                        this.toast = None;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2006,10 +2031,15 @@ impl App {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    // 同上：flex 子项默认 min-height:auto，内容比可视区高时
+                    // 它会撑高自己而不是出现滚动条。
+                    .min_h_0()
                     .min_w_0()
                     .gap_3()
                     .px_5()
-                    .pb_5()
+                    // 底部多留一点：内容被截在滚动区边界时，最后一张卡片贴着边
+                    // 会让人以为「页面到这里就断了」，留白能说明它还能往下滚。
+                    .pb_8()
                     .overflow_y_scroll()
                     .child(match view.as_ref() {
                         Some(r) => self.release_card(&track, r, sel, text_w, window, cx),
@@ -2096,7 +2126,11 @@ impl App {
     }
 
     /// 底部队列：只在有任务时出现。
-    fn queue_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    ///
+    /// 布局上它是 `render` 里根 flex 列的最后一个正常子项，**不是浮层**：
+    /// 展开时主内容区跟着变矮并出现滚动条，收起来只剩一行标题。
+    /// 之前这里无上限地长高，把页面下半截挤出去，看着就像被盖住了。
+    fn queue_panel(&self, vh: f32, cx: &mut Context<Self>) -> AnyElement {
         if self.tasks.is_empty() {
             return div().into_any_element();
         }
@@ -2105,48 +2139,107 @@ impl App {
             .iter()
             .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Queued | TaskStatus::Paused))
             .count();
+        let finished = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled
+                )
+            })
+            .count();
+        let open = self.queue_open.unwrap_or(running > 0);
+
+        // 标题行固定一行高：收起状态下整个队列就只占这一行，
+        // 不让它跟着任务数量一起往上长。
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .pl_5()
+            .pr_3()
+            .h(sp(42.))
+            .child(
+                div()
+                    .text_size(sp(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child(t("下载队列", "Downloads")),
+            )
+            // 全部结束时不再显示「0 进行中」——那一行只是噪音。
+            .when(running > 0, |d| {
+                d.child(badge(
+                    if i18n::is_en() {
+                        format!("{running} active")
+                    } else {
+                        format!("{running} 进行中")
+                    },
+                    ACCENT,
+                    ACCENT_SOFT,
+                ))
+            })
+            .when(running == 0 && finished > 0, |d| {
+                d.child(
+                    div()
+                        .text_size(sp(12.))
+                        .text_color(rgb(MUTED))
+                        .child(if i18n::is_en() {
+                            format!("{finished} finished")
+                        } else {
+                            format!("{finished} 项已结束")
+                        }),
+                )
+            })
+            .child(div().flex_1())
+            .when(finished > 0, |d| {
+                d.child(
+                    chip("btn-clear", t("清空已结束", "Clear finished"), MUTED, 0xF2F4F8)
+                        .when(!open, |d| d)
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_finished(cx))),
+                )
+            })
+            .child(
+                chip(
+                    "queue-toggle",
+                    if open {
+                        t("收起", "Hide")
+                    } else {
+                        t("展开", "Show")
+                    },
+                    if open { MUTED } else { ACCENT },
+                    if open { 0xF2F4F8 } else { ACCENT_SOFT },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.queue_open = Some(!open);
+                    cx.notify();
+                })),
+            );
+
         div()
             .flex()
             .flex_col()
-            .gap_2()
-            .px_5()
-            .py_3()
             .bg(rgb(CARD))
             .border_t_1()
             .border_color(rgb(BORDER))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(sp(13.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
-                            .child(t("下载队列", "Downloads")),
-                    )
-                    // 全部结束时不再显示「0 进行中」——那一行只是噪音。
-                    .when(running > 0, |d| {
-                        d.child(badge(
-                            if i18n::is_en() {
-                                format!("{running} active")
-                            } else {
-                                format!("{running} 进行中")
-                            },
-                            MUTED,
-                            0xF2F4F8,
-                        ))
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        btn("btn-clear", t("清空已结束", "Clear finished"), 0xF2F4F8, TEXT)
-                            .on_click(cx.listener(|this, _, _, cx| this.clear_finished(cx))),
-                    ),
-            )
-            .children(self.tasks.iter().take(3).map(|task| {
-                let id = task.spec.id.clone();
+            .child(head)
+            .when(open, |d| {
+                d.child(
+                    div()
+                        .id("queue-list")
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .px_5()
+                        .pb_3()
+                        // 最多占窗口两成高：再多主内容就只剩一条缝了，其余的
+                        // 在这里自己滚。没有这条上限时任务一多会把详情页顶出窗口。
+                        .max_h(px((vh * 0.22).max(110.)))
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(self.tasks.iter().take(8).map(|task| {
+                            let id = task.spec.id.clone();
                 let id2 = id.clone();
                 let pause_label = if task.status == TaskStatus::Running {
                     crate::i18n::t("暂停", "Pause")
@@ -2215,10 +2308,24 @@ impl App {
                                     .flex_1()
                                     .child(format!("{} · {}", task.spec.app, task.spec.file)),
                             )
+                            // 大小 / 速度 / 校验结果挤在同一行：队列是底部的附属信息，
+                            // 每项占两行会把主内容区压得只剩一条缝。
+                            .when(!detail.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .max_w(sp(330.))
+                                        .text_size(sp(12.))
+                                        .text_color(rgb(MUTED))
+                                        .text_ellipsis()
+                                        .flex_shrink_0()
+                                        .child(detail),
+                                )
+                            })
                             .child(
                                 div()
                                     .text_size(sp(12.))
                                     .text_color(rgb(status_color(task.status)))
+                                    .flex_shrink_0()
                                     .child(task.status.label()),
                             )
                             .when(!finished && !pause_label.is_empty(), |d| {
@@ -2321,30 +2428,28 @@ impl App {
                                 )
                             }),
                     )
-                    .when(!detail.is_empty(), |d| {
+                    // 进度条只在进行中/暂停时有意义。已结束的任务再横一条满格
+                    // 绿条，视觉上比信息本身还响，反而抢注意力。
+                    .when(!finished, |d| {
                         d.child(
                             div()
-                                .text_size(sp(12.))
-                                .text_color(rgb(MUTED))
-                                .text_ellipsis()
-                                .child(detail),
+                                .h(px(2.))
+                                .w_full()
+                                .rounded_full()
+                                // 比页面底色深一档，0% 时也能看出这是条进度轨道
+                                .bg(rgb(0xDDE3EE))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(task.frac()))
+                                        .rounded_full()
+                                        .bg(rgb(status_color(task.status))),
+                                ),
                         )
                     })
-                    .child(
-                        div()
-                            .h(px(3.))
-                            .w_full()
-                            .rounded_full()
-                            .bg(rgb(0xE9EDF4))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(task.frac()))
-                                    .rounded_full()
-                                    .bg(rgb(status_color(task.status))),
-                            ),
-                    )
-            }))
+                        }))
+                )
+            })
             .into_any_element()
     }
 
@@ -2909,23 +3014,40 @@ impl Render for App {
                     .flex()
                     .flex_row()
                     .flex_1()
+                    // 没有 min_h_0 时这一行按内容撑高：内容一长就顶出窗口，
+                    // 后面兄弟节点（队列、消息条）会画在它溢出的部分之上，
+                    // 看起来就像「被盖住了」。给定 0 下界它才会老实收缩。
+                    .min_h_0()
                     .overflow_hidden()
                     .child(self.sidebar(cx))
                     .child(self.main_panel(text_width, window, cx)),
             )
-            .child(self.queue_panel(cx))
-            // toast 要排在弹窗**之前**：它是整行一条，画在弹窗后面时会把
-            // 弹窗底部（保存/取消）盖住。
+            .child(self.queue_panel(vh, cx))
+            // toast 是**浮层**：`absolute` 不参与 flex 布局，出现和消失都不会
+            // 让页面跳一下，也不会把底部队列往上顶。放顶部居中是刻意的——
+            // 底部已经被队列占着，右下角还会压住「暂停 / 取消」这些按钮。
+            // 它排在弹窗之前，所以弹窗仍然盖在它上面。
             .children(toast.filter(|(_, at)| at.elapsed().as_secs() < 4).map(|(msg, _)| {
                 div()
+                    .absolute()
+                    .top(sp(140.))
+                    .right(sp(20.))
                     .flex()
                     .flex_row()
-                    .px_5()
-                    .py_2()
-                    .bg(rgb(0x1F2937))
-                    .text_size(sp(13.))
-                    .text_color(rgb(0xFFFFFF))
-                    .child(msg)
+                    .justify_end()
+                    .child(
+                        div()
+                            .max_w(sp(420.))
+                            .px_4()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(gpui::rgba(0x111827F2))
+                            .border_1()
+                            .border_color(gpui::rgba(0xFFFFFF1F))
+                            .text_size(sp(13.))
+                            .text_color(rgb(0xFFFFFF))
+                            .child(msg),
+                    )
             }))
             .child(self.dialog_layer(px((vh * 0.9).max(320.)), cx))
             // 菜单压在所有东西之上：它是「此刻唯一可点的东西」，被弹窗或 toast
