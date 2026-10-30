@@ -46,6 +46,11 @@ log = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.188"
 
+# 把 assets/app.ico 编进 exe 资源段（build.rs）。
+# GPUI 的 Windows 后端按资源 ID 1 取主图标，没有它 exe 就只有系统默认空白图标。
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [profile.release]
 opt-level = "z"
 lto = true

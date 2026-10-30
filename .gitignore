@@ -18,6 +18,11 @@
 .shot*.png
 .*-test.py
 
+# 图标中间产物：由 tools/build-icon.ps1 + tools/pack_ico.py 重新生成，
+# 只有成品 app.ico 与预览图 icon.png 进仓库
+/assets/icon-*.png
+/assets/*.bgra
+
 # Editor / OS noise
 .idea/
 .vscode/

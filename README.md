@@ -1,5 +1,7 @@
 # App Monitor · 跨平台软件追踪下载器
 
+<img src="assets/icon.png" width="72" align="right" alt="App Monitor 图标">
+
 ![release](https://img.shields.io/github/v/release/lordquest/app_monitor?label=release)
 ![build](https://img.shields.io/github/actions/workflow/status/lordquest/app_monitor/release.yml?label=build)
 ![license](https://img.shields.io/github/license/lordquest/app_monitor)
@@ -320,6 +322,38 @@ GPUI 0.2.2 没有文本选中：`Text` / `StyledText` 只负责把字画出来�
 **弹窗的高度**有个坑：`max_h` 只把卡片外框裁短，里面的 flex 布局拿不到「有界的高度」，内容
 会顶出卡片再被 `overflow_hidden` 切掉（设置项一多，底部的「保存」就点不到了）。所以内容区自己
 还要再限一次高并 `overflow_y_scroll()`，滚动条才会真的出现。
+
+### exe 图标：必须编进资源段，不能运行时设置
+
+第一版发出去的 exe 在资源管理器、任务栏、Alt-Tab 里都是 Windows 那个空白默认图标——因为
+项目里根本没有图标资源，也没人告诉链接器要带一个。
+
+- 图标来自 PE 里的 `RT_GROUP_ICON`，运行时调用 `SetClassLongPtr` 只能改已经被创建出来的
+  窗口，改不了「这个 exe 长什么样」。
+- GPUI 的 Windows 后端在 `load_icon()` 里是这么取的：
+  `LoadImageW(GetModuleHandleW(None), PCWSTR(1 as _), IMAGE_ICON, ..)`——**资源 ID 写死为 1**，
+  所以 `.rc` 里那行必须是 `1 ICON "assets/app.ico"`（ID 换成别的，窗口类就拿不到图标）。
+- `build.rs` 用 `embed-resource` 把资源编成 `.lib` 交给链接器；非 Windows 目标整段跳过。
+  没装 Windows SDK、找不到 `rc.exe` 时只 `cargo:warning`，不让构建失败。
+
+图标本身在仓库里是成品（`assets/app.ico`），要改颜色/形状就改脚本重生成：
+
+```powershell
+powershell -File tools/build-icon.ps1   # 按 16/20/24/32/40/48/64/128/256 逐尺寸直接绘制
+python tools/pack_ico.py                # 拼成 ICO：≤64 用 32bpp DIB，128/256 用 PNG
+```
+
+逐尺寸绘制而不是「画一张大图再缩」，是因为 16px 缩下去箭头会糊成一团；小尺寸那边单独把
+箭头和托盘加粗了一档。打包脚本不用 Pillow（机器上没有），ICO 容器就是
+`ICONDIR + 目录项 + 各尺寸数据`，自己拼比装依赖省事。
+
+**别往 `.rc` 里塞 manifest。** `gpui.lib` 里已经带了一份 `RT_MANIFEST`（声明
+`PerMonitorV2` + Common-Controls），再放一份同 ID 的资源会让 `CVTRES` 直接报
+「资源重复 (CVT1100)」、链接失败；换成 `/MANIFESTINPUT` 合并也一样，因为冲突的是资源本身
+而不是链接器生成的那份。顺带说明：DPI 感知一直是有的，界面在高分屏上不是靠系统拉伸的。
+
+Windows 会缓存 exe 图标：换新版本后如果资源管理器还显示旧图标，`ie4uinit.exe -show`
+或重启一次 `explorer.exe` 就好。
 
 ## 已知限制
 
