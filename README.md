@@ -42,11 +42,11 @@
 
 | 平台 | 文件 |
 | --- | --- |
-| Windows x64 | `app-monitor-v0.2.0-windows-x64.zip`（`app-monitor.exe`，需要 Windows 10 及以上） |
-| Linux x64 | `app-monitor-v0.2.0-linux-x64.tar.gz`（需 X11/Wayland + Vulkan 驱动） |
-| macOS arm64（Apple Silicon） | `app-monitor-v0.2.0-macos-arm64.tar.gz`（未签名，首次运行如被拦截执行 `xattr -d com.apple.quarantine ./app-monitor`） |
+| Windows x64 | `app-monitor-v0.2.1-windows-x64.zip`（`app-monitor.exe`，需要 Windows 10 及以上） |
+| Linux x64 | `app-monitor-v0.2.1-linux-x64.tar.gz`（需 X11/Wayland + Vulkan 驱动） |
+| macOS arm64（Apple Silicon） | `app-monitor-v0.2.1-macos-arm64.tar.gz`（未签名，首次运行如被拦截执行 `xattr -d com.apple.quarantine ./app-monitor`） |
 
-Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来自 GitHub Actions 同一份源码构建。版本号见 tag，本仓库目前对应 `0.2.0`。
+Windows 版可执行文件已在 Windows 上自测；Linux / macOS 二进制来自 GitHub Actions 同一份源码构建。版本号见 tag，本仓库目前对应 `0.2.1`。
 
 ## 特性
 
@@ -89,8 +89,8 @@ Windows 版通过 `.cargo/config.toml` 里的 `-C target-feature=+crt-static` �
 `.github/workflows/release.yml` 在三个 runner 上并行 `cargo build --release`（Windows x64 / Linux x64 / macOS arm64），并把产物打包上传：
 
 ```bash
-git tag -a v0.2.0 -m "app-monitor v0.2.0"   # 打 tag 即触发构建 + 发布 Release
-git push origin v0.2.0
+git tag -a v0.2.1 -m "app-monitor v0.2.1"   # 打 tag 即触发构建 + 发布 Release
+git push origin v0.2.1
 ```
 
 - 打 `v*` tag → 构建完成后自动创建 Release 并挂上三平台附件（含 `README.md` / `LICENSE`）。
