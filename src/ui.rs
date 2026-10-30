@@ -472,6 +472,36 @@ struct Selection {
     text: String,
 }
 
+/// 选区上右键弹出的菜单。
+///
+/// 位置存的是**窗口坐标下的逻辑像素**（`MouseDownEvent::position` 就是这个口径），
+/// 与根节点做绝对定位的参照系一致，所以不必再减一遍 bounds。
+struct CtxMenu {
+    x: f32,
+    y: f32,
+    owner: String,
+    text: String,
+}
+
+/// 选区的字节范围 → 可以放进剪贴板的字符串与字数。
+///
+/// 两端都要 snap：鼠标落在字形中间时 `index_at` 给出的是最近的字节索引，
+/// 直接切 `&str[a..b]` 有可能切在 UTF-8 中间而 panic。首尾空白一并去掉，
+/// 用户拖选时几乎不可能正好停在字上。
+fn picked(sel: &Selection) -> Option<(String, usize)> {
+    let a = crate::select_text::snap_to_char(&sel.text, sel.anchor.min(sel.head));
+    let b = crate::select_text::snap_to_char(&sel.text, sel.anchor.max(sel.head));
+    if a >= b {
+        return None;
+    }
+    let text = sel.text.get(a..b)?.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let n = text.chars().count();
+    Some((text, n))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FieldId {
     AddInput,
@@ -542,6 +572,9 @@ pub struct App {
     /// 最近一帧画出来的正文 bounds。鼠标事件挂在 div 上，拿不到元素自己的位置，
     /// 只能靠绘制阶段回填一次。
     sel_geom: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// 选区上右键弹出的菜单。松手即复制之外再给一条显式路径：用户习惯先选中、
+    /// 再右键点「复制」，缺了它就会被当成「这个界面不能复制」。
+    ctx: Option<CtxMenu>,
 }
 
 impl App {
@@ -627,6 +660,7 @@ impl App {
             title_lang: None,
             sel: None,
             sel_geom: Rc::new(RefCell::new(None)),
+            ctx: None,
         };
         app.spawn_pump(cx);
         if auto {
@@ -1374,6 +1408,8 @@ impl App {
         let drag = prep.clone();
         let owner_press = owner.clone();
         let text_press = text.to_string();
+        let owner_ctx = owner.clone();
+        let text_ctx = text.to_string();
         div()
             .id(SharedString::from(format!("sel:{owner}")))
             .on_mouse_down(
@@ -1399,6 +1435,14 @@ impl App {
             .on_mouse_up(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.select_finish(cx)),
+            )
+            // 右键只开菜单，不动选区 —— 选好的那一段要留在原位等高亮跟着菜单一起用。
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                    let p = ev.position;
+                    this.open_ctx(owner_ctx.clone(), text_ctx.clone(), p.x.into(), p.y.into(), cx);
+                }),
             )
             .child(crate::select_text::paint(
                 prep,
@@ -1435,17 +1479,180 @@ impl App {
         let Some(sel) = self.sel.as_ref() else {
             return;
         };
-        let a = crate::select_text::snap_to_char(&sel.text, sel.anchor.min(sel.head));
-        let b = crate::select_text::snap_to_char(&sel.text, sel.anchor.max(sel.head));
-        if a >= b {
+        let Some((picked, n)) = picked(sel) else {
             return;
-        }
-        let picked = sel.text.get(a..b).unwrap_or("").trim().to_string();
-        if picked.is_empty() {
-            return;
-        }
-        let n = picked.chars().count();
+        };
         self.copy(picked, What::Selection(n), cx);
+    }
+
+    // -- 选区的右键菜单 ----------------------------------------------------
+
+    fn open_ctx(
+        &mut self,
+        owner: String,
+        text: String,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.ctx = Some(CtxMenu { x, y, owner, text });
+        cx.notify();
+    }
+
+    fn close_ctx(&mut self, cx: &mut Context<Self>) {
+        if self.ctx.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 菜单里的「复制」。走的是和松手即复制同一条 `picked` → `copy`，两处措辞、
+    /// 字数统计不会出现两种口径。
+    fn ctx_copy(&mut self, cx: &mut Context<Self>) {
+        self.ctx = None;
+        match self.sel.as_ref().and_then(picked) {
+            Some((text, n)) => self.copy(text, What::Selection(n), cx),
+            None => self.toast(
+                t(
+                    "先用左键拖选一段文字，再复制",
+                    "Drag over some text first, then copy",
+                ),
+                cx,
+            ),
+        }
+    }
+
+    /// 整段选中。菜单里的这个入口比「从第一个字拖到最后一个字」实用得多。
+    fn ctx_select_all(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.ctx.take() else {
+            return;
+        };
+        let len = menu.text.len();
+        self.sel = Some(Selection {
+            owner: menu.owner,
+            anchor: 0,
+            head: len,
+            text: menu.text,
+        });
+        cx.notify();
+    }
+
+    fn ctx_clear(&mut self, cx: &mut Context<Self>) {
+        self.ctx = None;
+        self.sel = None;
+        cx.notify();
+    }
+
+    /// 右键菜单层：一层透明遮罩负责「点别处关掉」，菜单本身画在它上面。
+    ///
+    /// 遮罩覆盖整窗，所以菜单打开期间第一次点任何地方都只是关菜单 —— 这与
+    /// 系统菜单的行为一致，也免得把那次点击漏给下面的按钮。
+    fn ctx_layer(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu) = self.ctx.as_ref() else {
+            return div().into_any_element();
+        };
+        let has = self
+            .sel
+            .as_ref()
+            .filter(|s| s.owner == menu.owner)
+            .and_then(picked)
+            .is_some();
+        let w = 172. * scale();
+        let h = (if has { 3. } else { 2. } * 34. + 12.) * scale();
+        // 贴边时往里收：菜单是绝对定位的，敞着画会被窗口边缘截掉一半。
+        let x = menu.x.min((vw - w - 8.).max(8.)).max(8.);
+        let y = if menu.y + h + 8. > vh {
+            (menu.y - h).max(8.)
+        } else {
+            menu.y
+        };
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Act {
+            Copy,
+            All,
+            Clear,
+        }
+
+        let mut items: Vec<(Act, String, bool)> = Vec::new();
+        items.push((Act::Copy, t("复制", "Copy").to_string(), has));
+        items.push((Act::All, t("全选", "Select all").to_string(), true));
+        if has {
+            items.push((Act::Clear, t("取消选择", "Clear selection").to_string(), true));
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                // 透明遮罩本身不画任何东西，只负责接住那次「点别处」。
+                // 必须 stop_propagation：遮罩底下就是正文，事件继续往下走的话
+                // 正文会收到这次鼠标按下，把辛苦选好的选区改成空选区。
+                div()
+                    .id("ctx-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_ctx(cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_ctx(cx);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("ctx-menu")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .py(px(6. * scale()))
+                    .rounded_md()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .children(items.into_iter().enumerate().map(|(i, (act, label, enabled))| {
+                        let color = if enabled { TEXT } else { FAINT };
+                        div()
+                            .id(SharedString::from(format!("ctx-item-{i}")))
+                            .px_3()
+                            .py(px(7. * scale()))
+                            .text_size(sp(13.))
+                            .text_color(rgb(color))
+                            .whitespace_nowrap()
+                            .when(enabled, |d| {
+                                // 在**按下**时就行动，不是等松手：菜单下面压着正文，
+                                // 若这一下先漏给正文，选区会被改成空选区，等 on_click
+                                // 再复制就只剩「没有选中文字」了。系统菜单同样按下即选。
+                                d.cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            match act {
+                                                Act::Copy => this.ctx_copy(cx),
+                                                Act::All => this.ctx_select_all(cx),
+                                                Act::Clear => this.ctx_clear(cx),
+                                            }
+                                        }),
+                                    )
+                            })
+                            .child(label)
+                    })),
+            )
+            .into_any_element()
     }
 
     /// 切界面语言。立刻生效并落盘 —— 语言没有「取消」这种半程状态。
@@ -2721,6 +2928,9 @@ impl Render for App {
                     .child(msg)
             }))
             .child(self.dialog_layer(px((vh * 0.9).max(320.)), cx))
+            // 菜单压在所有东西之上：它是「此刻唯一可点的东西」，被弹窗或 toast
+            // 挡住的话用户会以为右键没生效。
+            .child(self.ctx_layer(vw, vh, cx))
     }
 }
 
@@ -3787,7 +3997,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::EditState;
+    use super::{EditState, Selection, picked};
 
     #[test]
     fn typing_appends_at_cursor() {
@@ -3821,6 +4031,39 @@ mod tests {
         e.insert("b", false);
         assert_eq!(e.text, "abc");
         assert_eq!(e.cursor, 2);
+    }
+
+    #[test]
+    fn picked_handles_reversed_selection_and_edges() {
+        let text = "安装 说明文字".to_string();
+        // 从右往左拖也是同一段，起点终点不必有序
+        let back = Selection {
+            owner: "n".into(),
+            anchor: text.len(),
+            head: 0,
+            text: text.clone(),
+        };
+        let (s, n) = picked(&back).expect("反向拖选也要能取到内容");
+        assert_eq!(s, text);
+        assert_eq!(n, 7, "字数按字符数算，不按字节");
+
+        // 只有一个光标位（点了没拖）时没有可复制的
+        let caret = Selection {
+            owner: "n".into(),
+            anchor: 3,
+            head: 3,
+            text: text.clone(),
+        };
+        assert!(picked(&caret).is_none());
+
+        // 故意传一个落在 UTF-8 中间的偏移：snap 到字边界，不能 panic
+        let mid = Selection {
+            owner: "n".into(),
+            anchor: 1,
+            head: 4,
+            text,
+        };
+        assert_eq!(picked(&mid).map(|(s, _)| s), Some("安".to_string()));
     }
 
     #[test]
