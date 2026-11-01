@@ -34,6 +34,7 @@ Download progress only shows up as a thin bar under the matching row on the left
 ![Add a track](docs/screenshot-add.png)
 ![Settings: language and UI scale](docs/screenshot-settings.png)
 ![English UI](docs/screenshot-en.png)
+![Japanese UI](docs/screenshot-ja.png)
 ![Drag to select text, release to copy](docs/screenshot-select.png)
 ![Context menu: copy / select all / clear selection](docs/screenshot-context-menu.png)
 ![Mark updates as read](docs/screenshot-updates.png)
@@ -62,7 +63,7 @@ The Windows binary is smoke-tested on Windows; the Linux / macOS binaries come f
 - **Mark updates as read**: when the newest release is newer than "the version you last looked at", the list shows an orange `↑ new x.y.z` and the top bar shows `N updates`. Once you have seen it, hit **Mark as read** on the detail page, or **Mark all as read** in the top bar to clear the lot. Marking only moves the "seen up to" pointer — the detail page still shows the latest version, and the reminder only comes back when upstream actually ships something new.
 - **A real downloader**: `Range` resume, `.part` temp files, pause / resume / cancel / retry, a concurrency cap, and SHA-256 verification on completion (GitHub publishes a digest per asset).
 - **Every takeaway has a button**: the `link` / `page` tag on an asset row is itself the action (download / open in browser), with **Copy** next to it for the URL. The version card has **Copy version** and **Copy link**, release notes have **Copy all** — version numbers and file names still go through buttons (the body text itself is drag-selectable, see two bullets down).
-- **Bilingual UI + UI scale**: the **中 / EN** switch sits at the far right of the top bar; it takes effect immediately and is written to `config.json`. Leave `lang` empty to follow the system language (that is what first launch does). Font size is adjustable from 80% to 180% in 10% steps, so high-DPI screens stop being a squint test (the default size is also one step larger than v0.1).
+- **Chinese / English / Japanese / Korean UI + UI scale**: the **中 / EN / 日 / 한** switch sits at the far right of the top bar; it takes effect immediately and is written to `config.json`. Leave `lang` empty to follow the system language (that is what first launch does — Windows recognises Chinese, Japanese and Korean, everything else gets English). Font size is adjustable from 80% to 180% in 10% steps, so high-DPI screens stop being a squint test (the default size is also one step larger than v0.1).
 - **Drag to select and copy in the overview body**: GPUI has no text selection, so selection highlighting and hit-testing are built on top of its layout results (see below). Release the mouse and the text is already in the clipboard; for an explicit route, right-click the selection for **Copy / Select all / Clear selection**. The selection survives a copy so you can keep extending it.
 - **History and progress**: a downloading row carries a thin progress bar in the left list, and hovering it shows bytes / speed / status. The full queue (pause, resume, cancel, retry, open file or folder) lives behind the **Downloads N** button in the top bar — open it and it takes space, click again and it is gone. There is also a history page (success / failure, verification result, open file or folder).
 - **Portable**: data lives in `app_monitor_data/` next to the executable by default, so moving the folder moves everything.
@@ -245,7 +246,7 @@ AM_LOG=1 app-monitor              # turn on debug logging
 AM_ALLOW_DOWNGRADE=1 app-monitor  # allow https → http downgrades for downloads (escape hatch, see above)
 AM_START_DIALOG=settings app-monitor   # open a dialog at startup: add / settings / history (screenshots and repros)
 AM_LOG_MOUSE=1 app-monitor        # print mouse-down events and the scale factor to stderr ("I clicked and nothing happened")
-AM_LANG=en app-monitor            # switch the UI to English for this run (does not write config.json)
+AM_LANG=ja app-monitor            # switch the UI language for this run: zh / en / ja / ko (does not write config.json)
 AM_UI_SCALE=1.3 app-monitor       # run the UI at 130% for this run (does not write config.json)
 AM_GPUI_FAKE_DL=1 app-monitor     # inject a fake "downloading" task: no requests, no history — just to check the bar and the hover card layout
 ```
@@ -270,20 +271,23 @@ GPUI delegates sizing to taffy. **Wrapped text with an automatic width** (`white
 - for elements in a row, the text cell gets `min_w_0()` + `text_ellipsis()` and the button gets `flex_shrink_0()`;
 - for long wrapped text, use a definite width computed from the window width in `render()` (the `text_w` that `main_panel` receives).
 
-### Font size, UI scale and the bilingual UI
+### Font size, UI scale and the four-language UI
 
 **Scaling is not the DPI factor.** GPUI's logical pixels are already converted to physical ones by the system scale (at 150%, 1 logical pixel = 1.5 physical pixels), so multiplying by DPI again would scale the UI twice. The real problem is that "11 logical pixels still look tiny on a 4K screen" (Windows' default UI font is 9pt ≈ 12 logical pixels), so there is a user-adjustable `ui_scale` (0.8–1.8, stored in `config.json`); the default 1.0 is already one step larger than v0.1.
 
 - Every font size, line height, input height and sidebar width goes through `sp(n)` (design value × `ui_scale`). Free functions like `badge()` / `chip()` have no `self`, so the factor lives in a process-level static — there is only one window, and scaling is global by nature.
 - The width used for wrapped text (the `370` constant in `render()`) is scaled too, otherwise the card gets narrower once the font grows.
 
-**Localisation** uses `i18n::t(中文, English)` with both strings written inline at the call site: a missed translation is visible at a glance in the English UI (one Chinese sentence left), and there is no "key mismatch silently falls back" failure mode. Language is also a process-level static, because `Tab::label()` / `SourceKind::label()` / `util::fmt_secs_ago()` cannot even reach `App`.
+**Localisation** has two layers. Chinese and English go inline as `i18n::t(中文, English)` — they are the two primary languages and the two lines that change first when copy is edited. Japanese and Korean live in the `TR` table at the bottom of `i18n.rs`, **indexed by the English string**. That way the 140-odd call sites do not turn into four lines each, and editing the Chinese copy never touches Japanese or Korean. Language is a process-level static, because `Tab::label()` / `SourceKind::label()` / `util::fmt_secs_ago()` cannot even reach `App`.
 
-- **Two entry points for language**: the **中 / EN** switch at the far right of the top bar, and the three-state setting (Chinese / English / follow system). The top bar one exists because "the UI is all foreign and I can't find where to change it" is a dead end — that is exactly the text the user cannot read.
-- An empty `lang` in `config.json` means **follow the system**; it is detected once at startup via `GetUserDefaultUILanguage` (just checking whether the primary language ID is 0x04). The result is not written back: if the user changes the system language temporarily, the next launch keeps up.
+- **A missed translation fails a test instead of requiring you to click through every language**: `translations_cover_sources` scans the sources, pulls the English string out of every `t(中文, English)` / `tf!(…)`, and fails if one is missing from the table. `translation_table_is_sorted_and_unique` guards the binary-search precondition (ascending, unique keys, no empty ja/ko). A miss falls back to English, so the UI never goes blank — but the test complains first.
+- Sentences with variables use `tf!("上次检查 {}", "checked {}", secs)`: word order differs per language, so where `{}` sits is written inside each language's own sentence rather than glued together at the call site. Only English inflects for plural, so counts like "N tracked items" go through `count_text()`, which shares one counter word across zh/ja/ko.
+- **Two entry points for language**: the **中 / EN / 日 / 한** four-cell switch at the far right of the top bar, and the five buttons in settings (Chinese / English / 日本語 / 한국어 / follow system). The top bar one exists because "the UI is all foreign and I can't find where to change it" is a dead end — that is exactly the text the user cannot read.
+- An empty `lang` in `config.json` means **follow the system**; it is detected once at startup via `GetUserDefaultUILanguage` (primary language ID: 0x04 Chinese, 0x11 Japanese, 0x12 Korean, everything else English). The result is not written back: if the user changes the system language temporarily, the next launch keeps up.
 - `history.json` stores statuses as **Chinese constants** (`完成` / `失败` / `已取消`) and translates on display — history files are shared across languages, and storing `done` would be untranslatable back to Chinese.
 - The window title follows the language: `&mut Window` is only available while painting, so it is set in `render`.
-- English UI uses Segoe UI; Chinese keeps Microsoft YaHei.
+- **The font follows the language**: Microsoft YaHei for Chinese, Segoe UI for English, Yu Gothic UI for Japanese, Malgun Gothic for Korean. The last two ship with Windows 10, so no font files are bundled — and they are not optional: Hangul rendered through YaHei is a row of tofu boxes.
+- Sidebar group names are data too (`@scene#54:"日常开发"` is user-editable), so only the four built-in names are translated; anything else is shown as-is.
 
 ### Selecting text in the overview body: no GPUI fork, just its layout results
 

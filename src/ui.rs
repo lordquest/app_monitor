@@ -30,6 +30,7 @@ use crate::download::DlSpec;
 use crate::engine::{Engine, UiMsg};
 use crate::http::Http;
 use crate::i18n::{self, t};
+use crate::tf;
 use crate::model::{Asset, AssetKind, Config, DownloadRecord, Release, Track};
 use crate::store::Store;
 use crate::util;
@@ -213,6 +214,41 @@ fn status_text(stored: &str) -> String {
         "已取消" => t("已取消", "canceled").to_string(),
         // 认不出来的取值原样显示，总比显示空白好查。
         other => other.to_string(),
+    }
+}
+
+/// 侧栏分组标题与详情页的分组徽章。
+///
+/// 分组名是数据里的字符串（`@scene#54:"日常开发"` 可以自定义），所以只翻内置的
+/// 那几个；认不出来的原样显示 —— 用户自己起的名字不该被翻译。
+fn group_label(group: &str) -> String {
+    match group {
+        "GitHub 项目" => t("GitHub 项目", "GitHub").to_string(),
+        "软件站" => t("软件站", "Download sites").to_string(),
+        "系统镜像" => t("系统镜像", "OS images").to_string(),
+        "日常开发" => t("日常开发", "Dev tools").to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 带计数的短语：英文分单复数，中/日/韩不分 —— 它们的量词跟在数字后面，
+/// 没有「1 个 / 2 个」以外的变化。
+///
+/// 实参是「数字后面那一截」，空格算在里面：`count_text(3, " 个追踪项", " item",
+/// " items", " 件", "개")`。
+fn count_text(
+    n: usize,
+    zh: &str,
+    en_one: &str,
+    en_many: &str,
+    ja: &str,
+    ko: &str,
+) -> String {
+    match i18n::current() {
+        i18n::Lang::Zh => format!("{n}{zh}"),
+        i18n::Lang::En => format!("{n}{}", if n == 1 { en_one } else { en_many }),
+        i18n::Lang::Ja => format!("{n}{ja}"),
+        i18n::Lang::Ko => format!("{n}{ko}"),
     }
 }
 
@@ -479,23 +515,19 @@ enum What {
 }
 
 impl What {
-    fn zh(&self) -> String {
+    /// 「被复制的东西」在当前语言下叫什么。
+    ///
+    /// 只给标签、不给整个句子：句子有「已复制 X」「没有可复制的 X」两种，
+    /// 而 X 本身又带名字或字数，把两侧都塞进同一个字符串只会变成拼贴。
+    fn label(&self) -> String {
         match self {
-            What::Version => "版本号".into(),
-            What::PageLink => "来源页链接".into(),
-            What::Notes => "更新说明".into(),
-            What::AssetLink(name) => format!("「{name}」的链接"),
-            What::Selection(n) => format!("选中的 {n} 个字"),
-        }
-    }
-
-    fn en(&self) -> String {
-        match self {
-            What::Version => "version number".into(),
-            What::PageLink => "source page link".into(),
-            What::Notes => "release notes".into(),
-            What::AssetLink(name) => format!("link to \"{name}\""),
-            What::Selection(n) => format!("selected {n} character(s)"),
+            What::Version => t("版本号", "version number").to_string(),
+            What::PageLink => t("来源页链接", "source page link").to_string(),
+            What::Notes => t("更新说明", "release notes").to_string(),
+            What::AssetLink(name) => tf!("「{}」的链接", "link to \"{}\"", name),
+            What::Selection(n) => {
+                tf!("选中的 {} 个字", "selected {} character(s)", n)
+            }
         }
     }
 }
@@ -1314,11 +1346,10 @@ impl App {
                 format!("（{skipped}）")
             };
             self.toast(
-                if i18n::is_en() {
-                    format!("No trackable URL found{detail}")
-                } else {
-                    format!("没能识别出可追踪的地址{detail}")
-                },
+                format!(
+                    "{}{detail}",
+                    t("没能识别出可追踪的地址", "No trackable URL found")
+                ),
                 cx,
             );
             return;
@@ -1348,11 +1379,11 @@ impl App {
 
         if added == 0 {
             self.toast(
-                if i18n::is_en() {
-                    format!("Nothing new — all {dup} are already tracked")
-                } else {
-                    format!("没有新增条目（{dup} 个已在列表里）")
-                },
+                tf!(
+                    "没有新增条目（{} 个已在列表里）",
+                    "Nothing new — all {} are already tracked",
+                    dup
+                ),
                 cx,
             );
             return;
@@ -1363,15 +1394,18 @@ impl App {
         self.dialog = None;
         self.toast(
             if dup > 0 {
-                if i18n::is_en() {
-                    format!("Added {added} item(s), skipped {dup} duplicate(s)")
-                } else {
-                    format!("已添加 {added} 个追踪项，跳过 {dup} 个重复项")
-                }
-            } else if i18n::is_en() {
-                format!("Added {added} item(s), checking versions…")
+                tf!(
+                    "已添加 {} 个追踪项，跳过 {} 个重复项",
+                    "Added {} item(s), skipped {} duplicate(s)",
+                    added,
+                    dup
+                )
             } else {
-                format!("已添加 {added} 个追踪项，开始检查版本…")
+                tf!(
+                    "已添加 {} 个追踪项，开始检查版本…",
+                    "Added {} item(s), checking versions…",
+                    added
+                )
             },
             cx,
         );
@@ -1416,11 +1450,11 @@ impl App {
         }
         crate::store::write_tracks(&self.tracks);
         self.toast(
-            if i18n::is_en() {
-                format!("Deleted \"{name}\" and its local record")
-            } else {
-                format!("已删除「{name}」")
-            },
+            tf!(
+                "已删除「{}」",
+                "Deleted \"{}\" and its local record",
+                name
+            ),
             cx,
         );
     }
@@ -1521,18 +1555,10 @@ impl App {
     fn copy(&mut self, text: impl Into<String>, what: What, cx: &mut Context<Self>) {
         let text = text.into();
         let msg = if text.trim().is_empty() {
-            if i18n::is_en() {
-                format!("Nothing to copy — no {}", what.en())
-            } else {
-                format!("没有可复制的{}", what.zh())
-            }
+            tf!("没有可复制的{}", "Nothing to copy — no {}", what.label())
         } else {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-            if i18n::is_en() {
-                format!("Copied {}", what.en())
-            } else {
-                format!("已复制{}", what.zh())
-            }
+            tf!("已复制{}", "Copied {}", what.label())
         };
         self.toast(msg, cx);
     }
@@ -1880,11 +1906,7 @@ impl App {
                             div()
                                 .text_size(sp(11.5))
                                 .text_color(rgb(ACCENT))
-                                .child(if i18n::is_en() {
-                                    format!("{n} files")
-                                } else {
-                                    format!("{n} 个文件")
-                                }),
+                                .child(tf!("{} 个文件", "{} files", n)),
                         )
                     }),
             )
@@ -2038,27 +2060,13 @@ impl App {
                     ),
             )
             .child(badge(
-                if i18n::is_en() {
-                    format!(
-                        "{total} item{}",
-                        if total == 1 { "" } else { "s" }
-                    )
-                } else {
-                    format!("{total} 个追踪项")
-                },
+                count_text(total, " 个追踪项", " item", " items", " 件", "개"),
                 MUTED,
                 0xF2F4F8,
             ))
             .when(updates > 0, |d| {
                 d.child(badge(
-                    if i18n::is_en() {
-                        format!(
-                            "{updates} update{}",
-                            if updates == 1 { "" } else { "s" }
-                        )
-                    } else {
-                        format!("{updates} 项有更新")
-                    },
+                    count_text(updates, " 项有更新", " update", " updates", " 件の更新", "개 업데이트"),
                     ORANGE,
                     ORANGE_SOFT,
                 ))
@@ -2073,13 +2081,14 @@ impl App {
                     .on_click(cx.listener(|this, _, _, cx| {
                         let n = this.mark_all_read(cx);
                         this.toast(
-                            if i18n::is_en() {
-                                format!(
+                            match i18n::current() {
+                                i18n::Lang::Zh => format!("已把 {n} 项更新标为已读"),
+                                i18n::Lang::En => format!(
                                     "Marked {n} update{} as read",
                                     if n == 1 { "" } else { "s" }
-                                )
-                            } else {
-                                format!("已把 {n} 项更新标为已读")
+                                ),
+                                i18n::Lang::Ja => format!("{n} 件の更新を既読にしました"),
+                                i18n::Lang::Ko => format!("{n}개 업데이트를 읽음 처리했습니다"),
                             },
                             cx,
                         );
@@ -2092,11 +2101,11 @@ impl App {
                     div()
                         .text_size(sp(12.5))
                         .text_color(rgb(ACCENT))
-                        .child(if i18n::is_en() {
-                            format!("Checking {}…", self.resolving.len())
-                        } else {
-                            format!("检查中 {}…", self.resolving.len())
-                        }),
+                        .child(tf!(
+                            "检查中 {}…",
+                            "Checking {}…",
+                            self.resolving.len()
+                        )),
                 )
             })
             // 下载队列的开关。队列默认收在底部之外，它的入口就放在「检查全部
@@ -2146,10 +2155,11 @@ impl App {
             .child(self.lang_switch(cx))
     }
 
-    /// 顶栏最右侧的语言切换：`中 | EN` 两个小格。
+    /// 顶栏最右侧的语言切换：`中 | EN | 日 | 한` 四个小格。
     ///
     /// 放在最外层而不是只藏在设置里，是因为「界面是外语，我找不到改语言的地方」
-    /// 是个死胡同 —— 用户不认识那些字，自然也猜不到哪颗按钮通向设置。
+    /// 是个死胡同 —— 用户不认识那些字，自然也猜不到哪颗按钮通向设置。四格直接
+    /// 平铺，各写自己的语言名缩写，切到哪种都还能认路。
     fn lang_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cur = i18n::current();
         let seg = |id: &'static str, want: i18n::Lang| {
@@ -2176,8 +2186,7 @@ impl App {
             .overflow_hidden()
             .border_1()
             .border_color(rgb(BORDER))
-            .child(seg("lang-zh", i18n::Lang::Zh))
-            .child(seg("lang-en", i18n::Lang::En))
+            .children(i18n::Lang::ALL.map(|l| seg(lang_seg_id(l), l)))
     }
 
     /// 某个追踪项当前**还没结束**的下载任务（排队 / 进行中 / 暂停），新的在前。
@@ -2311,7 +2320,7 @@ impl App {
                                     .text_size(sp(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(FAINT))
-                                    .child(group),
+                                    .child(group_label(&group)),
                             )
                             .children(rows.into_iter().map(|i| {
                                 let t = &self.tracks[i];
@@ -2590,11 +2599,7 @@ impl App {
             // 全部结束时不再显示「0 进行中」——那一行只是噪音。
             .when(running > 0, |d| {
                 d.child(badge(
-                    if i18n::is_en() {
-                        format!("{running} active")
-                    } else {
-                        format!("{running} 进行中")
-                    },
+                    tf!("{} 进行中", "{} active", running),
                     ACCENT,
                     ACCENT_SOFT,
                 ))
@@ -2604,11 +2609,7 @@ impl App {
                     div()
                         .text_size(sp(12.))
                         .text_color(rgb(MUTED))
-                        .child(if i18n::is_en() {
-                            format!("{finished} finished")
-                        } else {
-                            format!("{finished} 项已结束")
-                        }),
+                        .child(tf!("{} 项已结束", "{} finished", finished)),
                 )
             })
             .child(div().flex_1())
@@ -2683,21 +2684,12 @@ impl App {
                         .error
                         .clone()
                         .unwrap_or_else(|| t("下载失败", "download failed").into()),
-                    TaskStatus::Paused => {
-                        if i18n::is_en() {
-                            format!(
-                                "paused · {} / {}",
-                                util::fmt_bytes(task.downloaded),
-                                util::fmt_bytes(task.total)
-                            )
-                        } else {
-                            format!(
-                                "已暂停 · {} / {}",
-                                util::fmt_bytes(task.downloaded),
-                                util::fmt_bytes(task.total)
-                            )
-                        }
-                    }
+                    TaskStatus::Paused => tf!(
+                        "已暂停 · {} / {}",
+                        "paused · {} / {}",
+                        util::fmt_bytes(task.downloaded),
+                        util::fmt_bytes(task.total)
+                    ),
                     _ => String::new(),
                 };
                 div()
@@ -2890,7 +2882,7 @@ impl App {
                             .text_color(rgb(TEXT))
                             .child(track.name.clone()),
                     )
-                    .child(badge(track.group.clone(), MUTED, 0xF2F4F8))
+                    .child(badge(group_label(&track.group), MUTED, 0xF2F4F8))
                     .when(track.kind != crate::model::SourceKind::GitHub, |d| {
                         // GitHub 分组和来源名一样，重复显示一个 badge 只是噪音。
                         d.child(badge(track.kind.label(), MUTED, 0xF2F4F8))
@@ -2900,11 +2892,11 @@ impl App {
                             div()
                                 .text_size(sp(12.))
                                 .text_color(rgb(FAINT))
-                                .child(if i18n::is_en() {
-                                    format!("checked {}", util::fmt_secs_ago(ts))
-                                } else {
-                                    format!("上次检查 {}", util::fmt_secs_ago(ts))
-                                }),
+                                .child(tf!(
+                                    "上次检查 {}",
+                                    "checked {}",
+                                    util::fmt_secs_ago(ts)
+                                )),
                         )
                     })
                     .when_some(track.last_error.clone(), |d, err| {
@@ -3024,11 +3016,7 @@ impl App {
                     .text_size(sp(13.))
                     .text_color(rgb(FAINT))
                     .whitespace_normal()
-                    .child(if i18n::is_en() {
-                        format!("Source: {}", track.url)
-                    } else {
-                        format!("来源：{}", track.url)
-                    }),
+                    .child(tf!("来源：{}", "Source: {}", track.url)),
             )
             .into_any_element()
     }
@@ -3086,17 +3074,13 @@ impl App {
                                     .text_size(sp(13.))
                                     .text_color(rgb(MUTED))
                                     .text_ellipsis()
-                                    .child(if i18n::is_en() {
-                                        format!(
-                                            "{} · published {} · {}",
-                                            r.title, published, r.provider
-                                        )
-                                    } else {
-                                        format!(
-                                            "{} · 发布于 {} · 来源 {}",
-                                            r.title, published, r.provider
-                                        )
-                                    }),
+                                    .child(tf!(
+                                        "{} · 发布于 {} · 来源 {}",
+                                        "{} · published {} · {}",
+                                        r.title,
+                                        published,
+                                        r.provider
+                                    )),
                             ),
                     )
                     .when(sel > 0, |d| {
@@ -3184,17 +3168,11 @@ impl App {
                                 div().flex().flex_row().child(
                                     chip(
                                         format!("more-{tid}"),
-                                        if i18n::is_en() {
-                                            format!(
-                                                "Read the full notes ({} chars)",
-                                                full.chars().count()
-                                            )
-                                        } else {
-                                            format!(
-                                                "查看完整说明（共 {} 字）",
-                                                full.chars().count()
-                                            )
-                                        },
+                                        tf!(
+                                            "查看完整说明（共 {} 字）",
+                                            "Read the full notes ({} chars)",
+                                            full.chars().count()
+                                        ),
                                         ACCENT,
                                         ACCENT_SOFT,
                                     )
@@ -3358,17 +3336,11 @@ impl Render for App {
                                     .flex_1()
                                     .text_size(sp(13.))
                                     .text_color(rgb(TEXT))
-                                    .child(if i18n::is_en() {
-                                        format!(
-                                            "{} data file(s) could not be read — this session fell back to defaults",
-                                            self.issues.len()
-                                        )
-                                    } else {
-                                        format!(
-                                            "{} 个数据文件未能读取，本次已改用默认内容",
-                                            self.issues.len()
-                                        )
-                                    }),
+                                    .child(tf!(
+                                        "{} 个数据文件未能读取，本次已改用默认内容",
+                                        "{} data file(s) could not be read — this session fell back to defaults",
+                                        self.issues.len()
+                                    )),
                             )
                             .child(
                                 small("issue-open", t("打开数据目录", "Open data folder")).on_click(cx.listener(
@@ -3395,11 +3367,7 @@ impl Render for App {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| p.to_string_lossy().to_string());
-                                if i18n::is_en() {
-                                    format!("the original was kept as {name}")
-                                } else {
-                                    format!("原文件已备份为 {name}")
-                                }
+                                tf!("原文件已备份为 {}", "the original was kept as {}", name)
                             }
                             // 备份失败代表原文件仍在原地，程序这次不会覆盖它。
                             None => t(
@@ -3413,23 +3381,14 @@ impl Render for App {
                             .text_size(sp(12.))
                             .text_color(rgb(MUTED))
                             .whitespace_normal()
-                            .child(if i18n::is_en() {
-                                format!(
-                                    "· {} — {}, fell back to {}. {}",
-                                    i.file,
-                                    what,
-                                    fallback_text(i.fallback),
-                                    kept
-                                )
-                            } else {
-                                format!(
-                                    "· {} {}，本次使用{}。{}",
-                                    i.file,
-                                    what,
-                                    fallback_text(i.fallback),
-                                    kept
-                                )
-                            })
+                            .child(tf!(
+                                "· {} {}，本次使用{}。{}",
+                                "· {} — {}, fell back to {}. {}",
+                                i.file,
+                                what,
+                                fallback_text(i.fallback),
+                                kept
+                            ))
                     }))
             }))
             .child(self.top_bar(cx))
@@ -3486,64 +3445,74 @@ impl Render for App {
 // 小部件
 // ---------------------------------------------------------------------------
 
-/// 损坏文件横幅里的「原因」。中文直接用 `Display` —— 和命令行 `--check` 是
-/// 同一套措辞，不用维护两份；英文在这里给。
+/// 损坏文件横幅里的「原因」。
+///
+/// 中文与 `Display` 的措辞保持一致（命令行 `--check` 打的是那一套），但不再直接
+/// 借用 `Display`：日韩也得有说法，而 `Display` 只有中文一种。
 fn damage_text(d: &crate::store::Damage) -> String {
     use crate::store::Damage;
-    if !i18n::is_en() {
-        return d.to_string();
-    }
     match d {
-        Damage::Io(e) => format!("it could not be read: {e}"),
-        Damage::Empty => "the file was empty, most likely an interrupted write".to_string(),
-        Damage::BadJson(e) => format!("its content is not valid JSON ({e})"),
+        Damage::Io(e) => tf!("读取失败：{}", "it could not be read: {}", e),
+        Damage::Empty => t(
+            "文件是空的，可能是上次写入被中断",
+            "the file was empty, most likely an interrupted write",
+        )
+        .to_string(),
+        Damage::BadJson(e) => tf!(
+            "内容不是合法的 JSON（{}）",
+            "its content is not valid JSON ({})",
+            e
+        ),
     }
 }
 
 /// 出问题后这次会话改用了什么。
 fn fallback_text(f: crate::store::Fallback) -> String {
     use crate::store::Fallback;
-    if !i18n::is_en() {
-        return f.to_string();
-    }
     match f {
-        Fallback::DefaultConfig => "default settings".to_string(),
-        Fallback::DefaultTracks => "the built-in list".to_string(),
-        Fallback::EmptyHistory => "an empty history".to_string(),
+        Fallback::DefaultConfig => t("默认设置", "default settings").to_string(),
+        Fallback::DefaultTracks => {
+            t("内置的默认追踪清单", "the built-in list").to_string()
+        }
+        Fallback::EmptyHistory => t("空历史", "an empty history").to_string(),
     }
 }
 
-/// 界面字体：英文用 Segoe UI（更地道），中文继续用雅黑（字形与字重按它在调）。
+/// 语言切换小格的元素 id。GPUI 要求同一层里的 id 唯一且稳定，用语言代码拼。
+fn lang_seg_id(l: i18n::Lang) -> &'static str {
+    match l {
+        i18n::Lang::Zh => "lang-zh",
+        i18n::Lang::En => "lang-en",
+        i18n::Lang::Ja => "lang-ja",
+        i18n::Lang::Ko => "lang-ko",
+    }
+}
+
+/// 界面字体：每个语言用自己最地道的系统字体。
+///
+/// 中文继续用雅黑（字形与字重按它在调），英文 Segoe UI，日文 Yu Gothic UI，
+/// 韩文 Malgun Gothic —— 这三个都是 Win10 起自带的，不用打包字体文件。
+/// 其它平台沿用原来那一份：指定了不存在的字体时渲染层会回退到系统默认。
 fn ui_font() -> &'static str {
-    if i18n::is_en() && cfg!(windows) {
-        "Segoe UI"
-    } else {
-        "Microsoft YaHei UI"
+    if !cfg!(windows) {
+        return "Microsoft YaHei UI";
+    }
+    match i18n::current() {
+        i18n::Lang::Zh => "Microsoft YaHei UI",
+        i18n::Lang::En => "Segoe UI",
+        i18n::Lang::Ja => "Yu Gothic UI",
+        i18n::Lang::Ko => "Malgun Gothic",
     }
 }
 
 fn track_status(track: &Track) -> (String, u32) {
     if let Some(err) = &track.last_error {
         let short: String = err.chars().take(18).collect();
-        return (
-            if i18n::is_en() {
-                format!("failed · {short}")
-            } else {
-                format!("解析失败 · {short}")
-            },
-            RED,
-        );
+        return (tf!("解析失败 · {}", "failed · {}", short), RED);
     }
     if let Some(r) = &track.release {
         if track.has_update() {
-            return (
-                if i18n::is_en() {
-                    format!("↑ new {}", r.version)
-                } else {
-                    format!("↑ 新版本 {}", r.version)
-                },
-                ORANGE,
-            );
+            return (tf!("↑ 新版本 {}", "↑ new {}", r.version), ORANGE);
         }
         return (ver_label(&r.version), GREEN);
     }
@@ -3857,17 +3826,11 @@ impl App {
                             div()
                                 .text_size(sp(12.5))
                                 .text_color(rgb(ORANGE))
-                                .child(if i18n::is_en() {
-                                    format!(
-                                        "{} line(s) could not be parsed (ignored):",
-                                        self.add_skipped.len()
-                                    )
-                                } else {
-                                    format!(
-                                        "有 {} 行没能识别（已忽略）：",
-                                        self.add_skipped.len()
-                                    )
-                                }),
+                                .child(tf!(
+                                    "有 {} 行没能识别（已忽略）：",
+                                    "{} line(s) could not be parsed (ignored):",
+                                    self.add_skipped.len()
+                                )),
                         )
                         .children(self.add_skipped.iter().take(4).map(|s| {
                             div()
@@ -4061,10 +4024,8 @@ impl App {
                             .text_color(rgb(TEXT))
                             .child(if interval == 0 {
                                 t("已关闭", "off").to_string()
-                            } else if i18n::is_en() {
-                                format!("{interval} min")
                             } else {
-                                format!("{interval} 分钟")
+                                count_text(interval as usize, " 分钟", " min", " min", " 分", "분")
                             }),
                     )
                     .child(step_btn("btn-iv-more", "+").on_click(cx.listener(
@@ -4103,6 +4064,8 @@ impl App {
                     .gap_2()
                     .child(lang_btn("btn-lang-zh", Some(i18n::Lang::Zh), cx))
                     .child(lang_btn("btn-lang-en", Some(i18n::Lang::En), cx))
+                    .child(lang_btn("btn-lang-ja", Some(i18n::Lang::Ja), cx))
+                    .child(lang_btn("btn-lang-ko", Some(i18n::Lang::Ko), cx))
                     .child(lang_btn("btn-lang-auto", None, cx)),
             )
             .child(label(t(
@@ -4157,19 +4120,12 @@ impl App {
                         div()
                             .text_size(sp(12.))
                             .text_color(rgb(FAINT))
-                            .child(if i18n::is_en() {
-                                format!(
-                                    "v{} · data folder {}",
-                                    env!("CARGO_PKG_VERSION"),
-                                    crate::store::data_dir().display()
-                                )
-                            } else {
-                                format!(
-                                    "v{} · 数据目录 {}",
-                                    env!("CARGO_PKG_VERSION"),
-                                    crate::store::data_dir().display()
-                                )
-                            }),
+                            .child(tf!(
+                                "v{} · 数据目录 {}",
+                                "v{} · data folder {}",
+                                env!("CARGO_PKG_VERSION"),
+                                crate::store::data_dir().display()
+                            )),
                     ),
             );
         self.modal_shell(
@@ -4285,15 +4241,14 @@ impl App {
                         div()
                             .text_size(sp(12.))
                             .text_color(rgb(FAINT))
-                            .child(if i18n::is_en() {
-                                format!(
-                                    "{} record{}",
-                                    self.history.len(),
-                                    if self.history.len() == 1 { "" } else { "s" }
-                                )
-                            } else {
-                                format!("共 {} 条", self.history.len())
-                            }),
+                            .child(count_text(
+                                self.history.len(),
+                                " 条记录",
+                                " record",
+                                " records",
+                                " 件",
+                                "개",
+                            )),
                     ),
             );
         self.modal_shell(
@@ -4356,11 +4311,7 @@ impl App {
                         div()
                             .text_size(sp(12.5))
                             .text_color(rgb(FAINT))
-                            .child(if i18n::is_en() {
-                                format!("{} total", assets.len())
-                            } else {
-                                format!("{} 个", assets.len())
-                            }),
+                            .child(count_text(assets.len(), " 个", " total", " total", " 件", "개")),
                     ),
             )
             .when(assets.is_empty(), |d| {
