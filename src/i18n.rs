@@ -73,23 +73,14 @@ impl Lang {
         }
     }
 
-    /// 设置里那几颗语言按钮上显示的字，按各自的语言写（否则英文用户看不懂「英文」）。
+    /// 语言下拉按钮与菜单项上显示的字，按各自的语言写（否则英文用户看不懂「英文」）。
+    /// 按钮上写的是**当前**语言的名字：切到哪种界面都还认得出自己现在在哪。
     pub fn label(self) -> &'static str {
         match self {
             Lang::Zh => "中文",
             Lang::En => "English",
             Lang::Ja => "日本語",
             Lang::Ko => "한국어",
-        }
-    }
-
-    /// 顶栏那颗小切换按钮上的字，要短。
-    pub fn short(self) -> &'static str {
-        match self {
-            Lang::Zh => "中",
-            Lang::En => "EN",
-            Lang::Ja => "日",
-            Lang::Ko => "한",
         }
     }
 }
@@ -232,6 +223,7 @@ static TR: &[(&str, &str, &str)] = &[
     ("Added {} item(s), checking versions…", "{} 件追加しました。バージョンを確認しています…", "{}개 항목을 추가했습니다. 버전을 확인하는 중…"),
     ("Added {} item(s), skipped {} duplicate(s)", "{} 件追加しました（重複 {} 件はスキップ）", "{}개 항목을 추가했습니다 (중복 {}개 건너뜀)"),
     ("Alternative", "別バージョン", "대체 버전"),
+    ("Applied immediately", "すぐに反映されます", "즉시 적용됩니다"),
     ("Auto-check interval (0 = off)", "自動チェック間隔（0 = オフ）", "자동 확인 간격 (0 = 끔)"),
     ("Browse…", "参照…", "찾아보기…"),
     ("Cancel", "キャンセル", "취소"),

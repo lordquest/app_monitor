@@ -649,6 +649,15 @@ pub struct App {
     queue_show: bool,
     /// 悬停浮出的下载详情，见 [`DlPop`]。
     dl_pop: Option<DlPop>,
+    /// 语言下拉菜单。打开时存**锚点按钮**绘制时的 bounds（窗口坐标），菜单贴着
+    /// 它的右下角画。`None` 表示收起。
+    lang_menu: Option<Bounds<Pixels>>,
+    /// 顶栏与设置弹窗里那两颗语言按钮各自的 bounds，绘制阶段回填。
+    ///
+    /// 两处分开记而不是共用一个：设置弹窗关掉之后弹窗里那颗不再绘制，共用的话
+    /// 下一次点顶栏按钮会读到弹窗里那颗的旧坐标，菜单就飘到屏幕中间去了。
+    lang_anchor_top: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    lang_anchor_set: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// 选区上右键弹出的菜单。松手即复制之外再给一条显式路径：用户习惯先选中、
     /// 再右键点「复制」，缺了它就会被当成「这个界面不能复制」。
     ctx: Option<CtxMenu>,
@@ -740,6 +749,9 @@ impl App {
             ctx: None,
             queue_show: false,
             dl_pop: None,
+            lang_menu: None,
+            lang_anchor_top: Rc::new(RefCell::new(None)),
+            lang_anchor_set: Rc::new(RefCell::new(None)),
         };
         app.spawn_pump(cx);
         if auto {
@@ -1311,12 +1323,16 @@ impl App {
         }
         self.dialog = Some(which);
         self.active_field = None;
+        // 弹窗一开，设置里那颗按钮就换了位置（甚至被盖住），菜单还挂在旧坐标上
+        // 会悬在窗口中间。语言本身已经落盘，直接收起即可。
+        self.lang_menu = None;
         cx.notify();
     }
 
     fn close_dialog(&mut self, cx: &mut Context<Self>) {
         self.dialog = None;
         self.active_field = None;
+        self.lang_menu = None;
         cx.notify();
     }
 
@@ -2152,41 +2168,224 @@ impl App {
                     this.focus_field(FieldId::AddInput, cx);
                 }),
             ))
-            .child(self.lang_switch(cx))
+            .child(
+                self.lang_picker("btn-lang-top", self.lang_anchor_top.clone(), cx),
+            )
     }
 
-    /// 顶栏最右侧的语言切换：`中 | EN | 日 | 한` 四个小格。
+    /// 顶栏最右侧的语言下拉按钮：显示当前语言名，点开才列出全部。
     ///
-    /// 放在最外层而不是只藏在设置里，是因为「界面是外语，我找不到改语言的地方」
-    /// 是个死胡同 —— 用户不认识那些字，自然也猜不到哪颗按钮通向设置。四格直接
-    /// 平铺，各写自己的语言名缩写，切到哪种都还能认路。
-    fn lang_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 这里原先是一排「中 | EN | 日 | 한」小格，图的是「界面是外语时还认得出
+    /// 哪颗是自己」。语言越加越多，那排小格会把顶栏挤满，于是收成一颗下拉 ——
+    /// 按钮上写的是**当前语言自己的名字**，落到哪种界面都还能读出「我现在是
+    /// 中文 / English」，不至于两眼一抹黑找不到路。
+    ///
+    /// `geom` 是这颗按钮绘制时的矩形，由外面的容器用 `on_children_prepainted`
+    /// 回填 —— GPUI 的点击回调里拿不到元素自己的位置，菜单要贴边画只能这样。
+    fn lang_picker(
+        &self,
+        id: &'static str,
+        geom: Rc<RefCell<Option<Bounds<Pixels>>>>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let cur = i18n::current();
-        let seg = |id: &'static str, want: i18n::Lang| {
-            let active = cur == want;
-            div()
-                .id(id)
-                .flex_shrink_0()
-                .px_2()
-                .py_1()
-                .text_size(sp(12.))
-                .text_color(rgb(if active { 0xFFFFFF } else { MUTED }))
-                .bg(rgb(if active { ACCENT } else { 0xFFFFFF }))
-                .cursor_pointer()
-                .when(!active, |d| d.hover(|s| s.bg(rgb(0xF2F4F8))))
-                .child(want.short())
-                .on_click(cx.listener(move |this, _, _, cx| this.set_lang(want, cx)))
-        };
+        let open = self.lang_menu.is_some();
+        let cell_paint = geom.clone();
+        let cell_click = geom;
+        // 多包一层只为量到下面那颗按钮的 bounds：`on_children_prepainted` 给的
+        // 正是子元素的矩形，比在按钮里塞 canvas 干净（canvas 会参与布局）。
         div()
-            .flex()
-            .flex_row()
-            .items_center()
             .flex_shrink_0()
-            .rounded_md()
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(BORDER))
-            .children(i18n::Lang::ALL.map(|l| seg(lang_seg_id(l), l)))
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(b) = bounds.first() {
+                    *cell_paint.borrow_mut() = Some(*b);
+                }
+            })
+            .child(
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .min_w(sp(78.))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(if open { ACCENT_SOFT } else { 0xF2F4F8 }))
+                    .text_size(sp(13.))
+                    .text_color(rgb(if open { ACCENT } else { TEXT }))
+                    .hover(|s| s.opacity(0.88))
+                    .cursor_pointer()
+                    .child(div().flex_1().child(cur.label()))
+                    .child(
+                        div()
+                            .text_size(sp(9.))
+                            .text_color(rgb(if open { ACCENT } else { MUTED }))
+                            .child("▼"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let anchor = *cell_click.borrow();
+                        this.toggle_lang_menu(anchor, cx);
+                    })),
+            )
+    }
+
+    /// 开/关语言菜单。锚点还没量到（理论上不会 —— 点击一定发生在绘制之后）
+    /// 就当作没点，免得菜单在一个猜出来的坐标上冒出来。
+    fn toggle_lang_menu(&mut self, anchor: Option<Bounds<Pixels>>, cx: &mut Context<Self>) {
+        if self.lang_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if anchor.is_some() {
+            self.lang_menu = anchor;
+            cx.notify();
+        }
+    }
+
+    fn close_lang_menu(&mut self, cx: &mut Context<Self>) {
+        if self.lang_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 菜单里选一项。`None` 是「跟随系统」：配置里留空，下次启动重新检测。
+    fn pick_lang(&mut self, want: Option<i18n::Lang>, cx: &mut Context<Self>) {
+        self.lang_menu = None;
+        match want {
+            Some(l) => self.set_lang(l, cx),
+            None => self.set_lang_auto(cx),
+        }
+    }
+
+    /// 语言菜单层：透明遮罩（点别处收起）+ 贴锚点画的列表。
+    ///
+    /// 遮罩覆盖整窗、菜单画在它上面，与右键菜单是同一套做法：打开期间第一次点
+    /// 任何地方都只是收起菜单，不会漏给下面的按钮 —— 尤其是别再点一次那颗
+    /// 按钮，否则「点开 / 点关」会连成两次 toggle。
+    fn lang_menu_layer(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> AnyElement {
+        let Some(anchor) = self.lang_menu else {
+            return div().into_any_element();
+        };
+        let following = self.cfg.lang.trim().is_empty();
+        let cur = i18n::current();
+        // 「跟随系统」+ 现有语言。
+        let mut items: Vec<(Option<i18n::Lang>, &'static str, bool)> =
+            vec![(None, t("跟随系统", "System"), following)];
+        for l in i18n::Lang::ALL {
+            items.push((Some(l), l.label(), !following && cur == l));
+        }
+
+        let w = 196. * scale();
+        let item_h = 31. * scale();
+        // 高度估算法与悬停卡片一致：估高只用于贴边时翻向，多算几像素不露馅，
+        // 少算才会被窗口底边切掉。
+        let h = items.len() as f32 * item_h + 12. * scale();
+        let ax: f32 = anchor.origin.x.into();
+        let ay: f32 = anchor.origin.y.into();
+        let aw: f32 = anchor.size.width.into();
+        let ah: f32 = anchor.size.height.into();
+        // 右对齐按钮右沿（它在顶栏最右边，左对齐会把菜单往窗口外推），
+        // 横向再按窗口边缘收一下。
+        let x = (ax + aw - w).min((vw - w - 8.).max(8.)).max(8.);
+        let y = if ay + ah + h + 8. > vh {
+            (ay - h - 4.).max(8.)
+        } else {
+            ay + ah + 4.
+        };
+
+        let mk_item = |i: usize,
+                       want: Option<i18n::Lang>,
+                       label: &'static str,
+                       active: bool,
+                       cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(format!("lang-item-{i}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .h(px(item_h))
+                .text_size(sp(13.))
+                .text_color(rgb(if active { ACCENT } else { TEXT }))
+                .when(active, |d| d.bg(rgb(ACCENT_SOFT)))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(
+                    div()
+                        .w(sp(12.))
+                        .flex_shrink_0()
+                        .text_size(sp(11.))
+                        .child(if active { "✓" } else { "" }),
+                )
+                .child(div().flex_1().whitespace_nowrap().child(label))
+                // 按下即选，与右键菜单同理：遮罩下面压着正文，等 on_click 再动手
+                // 时那一下已经先落到底下的按钮上了。
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.pick_lang(want, cx);
+                    }),
+                )
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                div()
+                    .id("lang-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_lang_menu(cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_lang_menu(cx);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("lang-menu")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .py(px(6. * scale()))
+                    .rounded_md()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    // 第一项是「跟随系统」，其余四种语言之间拉一条细线：前者是
+                    // 「怎么决定」，后者是「决定成什么」，两类不该混在一起读。
+                    .child(mk_item(0, items[0].0, items[0].1, items[0].2, cx))
+                    .child(
+                        div()
+                            .mx_3()
+                            .my_1()
+                            .h(px(1.))
+                            .bg(rgb(BORDER)),
+                    )
+                    .children(items[1..].iter().enumerate().map(|(i, (want, label, active))| {
+                        mk_item(i + 1, *want, label, *active, cx)
+                    })),
+            )
+            .into_any_element()
     }
 
     /// 某个追踪项当前**还没结束**的下载任务（排队 / 进行中 / 暂停），新的在前。
@@ -3438,6 +3637,9 @@ impl Render for App {
             // 菜单压在所有东西之上：它是「此刻唯一可点的东西」，被弹窗或 toast
             // 挡住的话用户会以为右键没生效。
             .child(self.ctx_layer(vw, vh, cx))
+            // 语言菜单压在最上面：它由顶栏或设置里的那颗下拉按钮拉起，两者都
+            // 可能被弹窗盖着，菜单再被盖住就成了「点了没反应」。
+            .child(self.lang_menu_layer(vw, vh, cx))
     }
 }
 
@@ -3475,16 +3677,6 @@ fn fallback_text(f: crate::store::Fallback) -> String {
             t("内置的默认追踪清单", "the built-in list").to_string()
         }
         Fallback::EmptyHistory => t("空历史", "an empty history").to_string(),
-    }
-}
-
-/// 语言切换小格的元素 id。GPUI 要求同一层里的 id 唯一且稳定，用语言代码拼。
-fn lang_seg_id(l: i18n::Lang) -> &'static str {
-    match l {
-        i18n::Lang::Zh => "lang-zh",
-        i18n::Lang::En => "lang-en",
-        i18n::Lang::Ja => "lang-ja",
-        i18n::Lang::Ko => "lang-ko",
     }
 }
 
@@ -3898,35 +4090,6 @@ impl App {
         let interval = self.cfg.check_interval_min;
         // 显示生效值而不是配置值：`AM_UI_SCALE` 这类临时覆盖下两者会不一致。
         let ui_scale = scale();
-        // 语言按钮：点了立刻生效，不像别的设置那样要按「保存」—— 换错语言之后
-        // 弹窗里的字已经变了，得能马上切回来。三态：中文 / English / 跟随系统。
-        let lang_btn = |id: &'static str, want: Option<i18n::Lang>, cx: &mut Context<Self>| {
-            let following = self.cfg.lang.trim().is_empty();
-            let active = match want {
-                // 跟随系统时也不额外高亮实际语言，否则两颗按钮一起亮，看不出
-                // 「现在到底是选的还是跟着系统走的」。
-                Some(w) => !following && i18n::current() == w,
-                None => following,
-            };
-            let text = match want {
-                Some(w) => w.label(),
-                None => t("跟随系统", "System"),
-            };
-            div()
-                .id(id)
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .bg(rgb(if active { ACCENT_SOFT } else { 0xF2F4F8 }))
-                .text_size(sp(13.))
-                .text_color(rgb(if active { ACCENT } else { TEXT }))
-                .cursor_pointer()
-                .child(text)
-                .on_click(cx.listener(move |this, _, _, cx| match want {
-                    Some(w) => this.set_lang(w, cx),
-                    None => this.set_lang_auto(cx),
-                }))
-        };
 
         let dir_row = div()
             .flex()
@@ -4062,11 +4225,15 @@ impl App {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(lang_btn("btn-lang-zh", Some(i18n::Lang::Zh), cx))
-                    .child(lang_btn("btn-lang-en", Some(i18n::Lang::En), cx))
-                    .child(lang_btn("btn-lang-ja", Some(i18n::Lang::Ja), cx))
-                    .child(lang_btn("btn-lang-ko", Some(i18n::Lang::Ko), cx))
-                    .child(lang_btn("btn-lang-auto", None, cx)),
+                    // 和顶栏那颗同一个控件：语言一多，一排按钮立刻摊不开，
+                    // 两处都收成下拉，新语言只需要往 `Lang` 里加一项。
+                    .child(self.lang_picker("btn-lang-set", self.lang_anchor_set.clone(), cx))
+                    .child(
+                        div()
+                            .text_size(sp(12.))
+                            .text_color(rgb(FAINT))
+                            .child(t("切换后立即生效", "Applied immediately")),
+                    ),
             )
             .child(label(t(
                 "界面缩放（高 DPI 屏上嫌字小就调大）",
