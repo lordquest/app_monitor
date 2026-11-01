@@ -2931,7 +2931,7 @@ impl App {
                             div()
                                 .text_size(sp(13.5))
                                 .text_color(rgb(MUTED))
-                                .child(format!("v{v}")),
+                                .child(ver_label(&v)),
                         )
                     })
                     .when(track.has_update(), |d| {
@@ -3044,7 +3044,7 @@ impl App {
     ) -> AnyElement {
         let url = r.page_url.clone();
         let copy_url = r.page_url.clone();
-        let ver_text = format!("v{}", r.version);
+        let ver_text = ver_label(&r.version);
         let published = r
             .published
             .clone()
@@ -3100,15 +3100,17 @@ impl App {
                             ),
                     )
                     .when(sel > 0, |d| {
-                        d.child(badge(
-                            if r.candidates.get(sel).map(|c| c.prerelease).unwrap_or(false) {
-                                t("预览版", "Preview")
-                            } else {
-                                t("备选版本", "Alternative")
+                        let cand = r.candidates.get(sel);
+                        // 滚动构建（Nightly / Snapshot）直接报频道名，比笼统的「预览版」
+                        // 更能说明「这条每天都变、装它是有代价的」。
+                        let label = match cand.and_then(|c| c.channel()) {
+                            Some(ch) => capitalize(&ch),
+                            None => match cand.map(|c| c.prerelease).unwrap_or(false) {
+                                true => t("预览版", "Preview").to_string(),
+                                false => t("备选版本", "Alternative").to_string(),
                             },
-                            ORANGE,
-                            ORANGE_SOFT,
-                        ))
+                        };
+                        d.child(badge(label, ORANGE, ORANGE_SOFT))
                     })
                     .when(sel == 0 && track.has_update(), |d| {
                         d.child(badge(t("发现新版本", "New version"), ORANGE, ORANGE_SOFT))
@@ -3543,9 +3545,28 @@ fn track_status(track: &Track) -> (String, u32) {
                 ORANGE,
             );
         }
-        return (format!("v{}", r.version), GREEN);
+        return (ver_label(&r.version), GREEN);
     }
     (t("等待首次检查", "waiting for first check").to_string(), FAINT)
+}
+
+/// 版本号前面那个 `v`：只有数字开头的才加。`nightly 20261031` 前面挂个 v 会变成
+/// 「vnightly」，而它根本不是版本号。
+fn ver_label(v: &str) -> String {
+    let v = v.trim();
+    match v.chars().next() {
+        Some(c) if c.is_ascii_digit() => format!("v{v}"),
+        _ => v.to_string(),
+    }
+}
+
+/// `nightly` → `Nightly`：频道名在数据里是小写标识符，直接贴上标签不够体面。
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 fn badge(text: impl Into<SharedString>, fg: u32, bg: u32) -> Div {

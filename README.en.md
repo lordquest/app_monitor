@@ -58,7 +58,7 @@ The Windows binary is smoke-tested on Windows; the Linux / macOS binaries come f
   - Software sites (WordPress / ZBlog style): site search `?s=<keyword>` → score the results → fetch the article body → extract download links, version and release notes.
   - A single article: parsed directly.
 - **Versions you can read**: stable releases win; sub-crate releases mixed into the same repo (`ignore-0.4.33`) are down-ranked.
-- **Multiple version candidates**: when a repo publishes several lines at once (nyaterm's stable `1.3.0` alongside preview `2.0.0-preview.7`), the version card lists up to three candidate tags in its lower right corner. One click swaps the file list and release notes to that version, and pre-releases are marked in orange.
+- **Multiple version candidates**: when a repo publishes several lines at once (nyaterm's stable `1.3.0` alongside preview `2.0.0-preview.7`), the version card lists up to three candidate tags in its lower right corner. One click swaps the file list and release notes to that version, and pre-releases are marked in orange. Projects that ship every night (`nightly-20261031`) get a tab of their own, labelled `Nightly`.
 - **Mark updates as read**: when the newest release is newer than "the version you last looked at", the list shows an orange `↑ new x.y.z` and the top bar shows `N updates`. Once you have seen it, hit **Mark as read** on the detail page, or **Mark all as read** in the top bar to clear the lot. Marking only moves the "seen up to" pointer — the detail page still shows the latest version, and the reminder only comes back when upstream actually ships something new.
 - **A real downloader**: `Range` resume, `.part` temp files, pause / resume / cancel / retry, a concurrency cap, and SHA-256 verification on completion (GitHub publishes a digest per asset).
 - **Every takeaway has a button**: the `link` / `page` tag on an asset row is itself the action (download / open in browser), with **Copy** next to it for the URL. The version card has **Copy version** and **Copy link**, release notes have **Copy all** — version numbers and file names still go through buttons (the body text itself is drag-selectable, see two bullets down).
@@ -145,10 +145,23 @@ Different release lines of the same repo are collected under "version candidates
 | Example | Candidates | Notes |
 | --- | --- | --- |
 | `nyaterm` | `1.3.0 stable` / `2.0.0-preview.7 preview` / `1.2.12 stable` | The stable release stays "latest"; the preview sits next to it with an orange tag |
+| `ARMSX2` | `2.9.1 stable` / `nightly 20261031` / `2.8.4 stable` | One `nightly-YYYYMMDD` per night; the whole nightly line takes a single tab and shows the newest night |
 | `mpv_PlayKit` | just 1 | Date-style tags (`20260510`) belong to one line, so you do not get a new tag every day |
 | `deepx-code` | just 1 | `0.2.x` is a single line; older versions live under "past versions" |
 
 Rule: merge by `major.minor` (`2.0.0-preview.7` → `2.0`), keep only the newest entry per line. Stable first, then preview lines, then the rest. Switching tags only changes what is displayed and which asset is downloaded; `seen_version` (the update prompt) always follows the stable release.
+
+### Rolling builds (nightly / snapshot)
+
+![Nightly as a candidate](docs/screenshot-nightly.png)
+
+Projects that ship automatically every night do not tag with versions at all — they tag "channel + date": `nightly-20261031`, `snapshot-2026.10`. Those are grouped by **channel**, not by date:
+
+- a tag that starts with a channel word (`nightly-…`, `snapshot-…`, `canary-…`), or that puts a date right after the prefix (`build-20261031`), counts as a rolling build; `ignore-0.4.33` (a sub-crate version) and `mpv-lazy-20241013` (date not directly after the hyphen) are not misfiled.
+- they are **no longer** down-ranked as "some other crate's release" and dropped from the candidates — that rule was exactly why ARMSX2's nightly only ever showed up as a one-line "another preview exists" warning.
+- one tab per channel, newest build only (otherwise you get a new tab every night), placed after the stable release and labelled with the channel name (`Nightly`).
+- rolling builds are kept out of "past versions": eight nightly entries would bury the real releases. Repos that only ship nightlies are the exception.
+- the version reads `nightly 20261031`; the leading `v` is only added to numeric versions.
 
 ## Download behaviour
 

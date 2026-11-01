@@ -280,6 +280,80 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 // ---------------------------------------------------------------------------
+// Rolling release channels
+// ---------------------------------------------------------------------------
+
+/// 自动出包的「滚动发布线」常见名字。大小写不敏感，按整词比较。
+const ROLLING_CHANNELS: &[&str] = &[
+    "nightly",
+    "snapshot",
+    "canary",
+    "daily",
+    "unstable",
+    "testing",
+    "edge",
+    "ci",
+    "dev",
+];
+
+/// 如果一个 tag 属于滚动发布线，返回频道名（小写）；否则 `None`。
+///
+/// `nightly-20261031` 里的 `nightly` 不是版本号的一部分，而是**发布线**的名字：
+/// 同一频道的每一次构建都该并入同一条线，否则一年下来会攒出几百个候选标签。
+/// 判定两种形态：
+///
+/// * 频道名打头 —— `nightly-20261031`、`snapshot-2026.10`、`canary`；
+/// * 未知前缀 + 日期尾巴 —— `build-20261031`，日期是 `20261031` 这种 6–8 位纯数字，
+///   或 `2026-10-31` / `2026.10.31` 这种首段 4 位的三段式。
+///
+/// 反例（必须判为 `None`）：`ignore-0.4.33`（子 crate 的版本号）、`mpv-lazy-20241013`
+/// （日期不是紧跟在连字符后面）、`deepx-0.2.113`。
+pub fn channel_of(tag: &str) -> Option<String> {
+    let bare = tag.trim().trim_start_matches('v');
+    if bare.is_empty() {
+        return None;
+    }
+    let lower = bare.to_ascii_lowercase();
+    if ROLLING_CHANNELS.contains(&lower.as_str()) {
+        return Some(lower);
+    }
+    // 连字符与空格都算分隔：`nightly-20261031` 是 tag 原样，`nightly 20261031`
+    // 是格式化之后的展示版（见 `version_from_tag`），后者也要能认出来。
+    let sep = bare.find(['-', ' ']).filter(|i| *i > 0)?;
+    let (prefix, rest) = bare.split_at(sep);
+    let rest = rest[1..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let prefix_l = prefix.to_ascii_lowercase();
+    if ROLLING_CHANNELS.contains(&prefix_l.as_str()) {
+        return Some(prefix_l);
+    }
+    if is_date_like(rest) {
+        return Some(prefix_l);
+    }
+    None
+}
+
+/// `20261031` / `2026-10-31` / `2026.10.31` —— 日期，不是版本号。
+fn is_date_like(s: &str) -> bool {
+    let s = s.trim_start_matches('v');
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '-' || c == '.' || c == '_')
+    {
+        return false;
+    }
+    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 6 || digits.len() == 8 {
+        return true;
+    }
+    // 三段式：首段必须是 4 位年份，`1.2.3` 这种版本号不会命中。
+    let parts: Vec<&str> = s.split(['-', '.', '_']).collect();
+    parts.len() == 3 && parts[0].len() == 4 && parts[0].chars().all(|c| c.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
 // Fuzzy name matching for site search results
 // ---------------------------------------------------------------------------
 

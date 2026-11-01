@@ -105,20 +105,30 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// Short tab caption: `1.3.0 稳定` / `2.0.0-preview.7 预览`.
+    /// 滚动发布线的频道名（`nightly` / `snapshot` …），稳定版与普通预览版是 `None`。
+    pub fn channel(&self) -> Option<String> {
+        util::channel_of(&self.version)
+    }
+
+    /// Short tab caption: `1.3.0 稳定` / `2.0.0-preview.7 预览` / `nightly 20261031`.
     pub fn tab_label(&self) -> String {
+        let v = self.version.trim();
+        // 滚动构建的版本串本身已经写明频道了，再补一个「预览」只是重复。
+        if self.channel().is_some() {
+            return v.to_string();
+        }
         let channel = if self.prerelease {
             crate::i18n::t("预览", "preview")
         } else {
             crate::i18n::t("稳定", "stable")
         };
-        if self.version.trim().is_empty() {
+        if v.is_empty() {
             channel.to_string()
         } else if crate::i18n::is_en() {
             // 英文里版本号与频道之间习惯用空格而不是直接连着写。
-            format!("{} · {channel}", self.version.trim())
+            format!("{} · {channel}", v)
         } else {
-            format!("{} {channel}", self.version.trim())
+            format!("{} {channel}", v)
         }
     }
 }

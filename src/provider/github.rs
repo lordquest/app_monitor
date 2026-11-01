@@ -217,9 +217,22 @@ async fn resolve_atom(http: &Http, owner: &str, repo: &str) -> Result<Release, S
         }
     }
 
-    let history: Vec<VersionEntry> = entries
+    // 历史版本里不列滚动构建：一天一个 tag，八条全是夜构建，真正的版本反而被埋了。
+    // 但如果这条仓库**只**发夜构建，就别把历史清空。
+    let scored: Vec<AtomEntry> = entries
         .into_iter()
         .filter(|e| entry_score(&e.tag, &e.title, repo) >= 0)
+        .collect();
+    let mut hist_src: Vec<AtomEntry> = scored
+        .iter()
+        .filter(|e| util::channel_of(&e.tag).is_none())
+        .cloned()
+        .collect();
+    if hist_src.is_empty() {
+        hist_src = scored;
+    }
+    let history: Vec<VersionEntry> = hist_src
+        .into_iter()
         .take(8)
         .map(|e| VersionEntry {
             version: version_from_tag(&e.tag, &e.title),
@@ -276,7 +289,13 @@ fn candidate_entries(primary: &AtomEntry, others: &[AtomEntry], repo: &str) -> V
 }
 
 /// `v2.0.0-preview.7` → `2.0`, so a dozen previews collapse into a single tab.
+///
+/// 滚动构建（`nightly-20261031`）按**频道**归并：`nightly` 每天一个 tag，按 tag
+/// 本身分组等于每天多出一个候选标签，所以整条频道只占一个位置，取最新的那个。
 fn release_line(tag: &str) -> String {
+    if let Some(ch) = util::channel_of(tag) {
+        return format!("channel:{ch}");
+    }
     let t = tag.trim().trim_start_matches('v');
     let core: String = t
         .chars()
@@ -339,9 +358,13 @@ fn is_prerelease(tag: &str) -> bool {
         .any(|m| t.contains(m))
 }
 
-fn entry_score(tag: &str, title: &str, repo: &str) -> i32 {    let bare = tag.trim().trim_start_matches('v');
+fn entry_score(tag: &str, title: &str, repo: &str) -> i32 {
+    let bare = tag.trim().trim_start_matches('v');
     let repo_l = repo.to_ascii_lowercase();
     let tag_l = tag.to_ascii_lowercase();
+    // `nightly-20261031` 是这条发布线的构建，不是「别的 crate 的发布」，下面那条
+    // 子 crate 惩罚对它必须失效 —— 否则夜构建会被 -120 直接踢出候选与历史。
+    let channel = util::channel_of(tag);
     let mut score = 0;
     let pure_version = bare
         .chars()
@@ -364,19 +387,25 @@ fn entry_score(tag: &str, title: &str, repo: &str) -> i32 {    let bare = tag.tr
     {
         score += 40;
     }
+    if channel.is_some() {
+        // 与预览版同档：值得单独列一条候选，但排在稳定版之后。
+        score += 40;
+    }
     if tag_l.starts_with(&repo_l) {
         score += 50;
     }
     // `crate-1.2.3` where the prefix is not this repo → a sub-crate release.
-    if let Some((prefix, rest)) = tag.split_once('-') {
-        let rest_bare = rest.trim_start_matches('v');
-        let looks_versioned = rest_bare
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false);
-        if looks_versioned && !prefix.is_empty() && !prefix.eq_ignore_ascii_case(repo) {
-            score -= 120;
+    if channel.is_none() {
+        if let Some((prefix, rest)) = tag.split_once('-') {
+            let rest_bare = rest.trim_start_matches('v');
+            let looks_versioned = rest_bare
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
+            if looks_versioned && !prefix.is_empty() && !prefix.eq_ignore_ascii_case(repo) {
+                score -= 120;
+            }
         }
     }
     if title.to_ascii_lowercase().contains(&repo_l) {
@@ -386,7 +415,15 @@ fn entry_score(tag: &str, title: &str, repo: &str) -> i32 {    let bare = tag.tr
 }
 
 /// `20260510` style tags are dates; the release title (`2026FM`) reads better.
-fn version_from_tag(tag: &str, title: &str) -> String {    let t = tag.trim();
+fn version_from_tag(tag: &str, title: &str) -> String {
+    let t = tag.trim();
+    // `nightly-20261031` → `nightly 20261031`：连字符会让它看着像版本号的一部分，
+    // 而这里想表达的是「哪个频道 + 哪一晚」。
+    if util::channel_of(t).is_some() {
+        if let Some((head, rest)) = t.split_once('-') {
+            return format!("{} {}", head.trim_start_matches('v'), rest);
+        }
+    }
     let digits_only = t.chars().all(|c| c.is_ascii_digit());
     if digits_only && t.len() >= 6 && !title.trim().is_empty() {
         title.trim().to_string()
@@ -655,6 +692,60 @@ mod tests {
         // A product-prefixed tag on a repo without a "clean" release stays newest.
         let prefixed = vec![entry("mpv-lazy-20241013"), entry("mpv-lazy-20240901")];
         assert_eq!(best_entry(&prefixed, "mpv_PlayKit"), 0);
+    }
+
+    /// 真实案例 ARMSX2：稳定版 2.9.1 之下每天一个 `nightly-YYYYMMDD`。
+    /// 夜构建既不能被当成子 crate 踢掉，也不能一天占一个候选标签。
+    #[test]
+    fn nightly_channel_is_a_candidate_next_to_stable() {
+        let entry = |tag: &str| AtomEntry {
+            title: tag.to_string(),
+            tag: tag.to_string(),
+            url: format!("https://github.com/ARMSX2/ARMSX2/releases/tag/{tag}"),
+            date: None,
+            notes: String::new(),
+        };
+        let feed = vec![
+            entry("nightly-20261031"),
+            entry("nightly-20261029"),
+            entry("2.9.1"),
+            entry("nightly-20261028"),
+            entry("2.9"),
+        ];
+        // 稳定版仍是「最新版本」，夜构建不顶掉它。
+        let pick = best_entry(&feed, "ARMSX2");
+        assert_eq!(feed[pick].tag, "2.9.1");
+
+        let mut others = feed.clone();
+        let primary = others.remove(pick);
+        let cands = candidate_entries(&primary, &others, "ARMSX2");
+        let tags: Vec<&str> = cands.iter().map(|c| c.tag.as_str()).collect();
+        // 整条 nightly 线只占一个位置，取最新那一晚。
+        assert_eq!(tags, vec!["2.9.1", "nightly-20261031"]);
+        assert!(is_prerelease(&cands[1].tag));
+        assert_eq!(
+            version_from_tag("nightly-20261031", "ARMSX2 nightly 20261031"),
+            "nightly 20261031"
+        );
+        // 子 crate 惩罚仍然生效，否则夜构建的豁免会把 ripgrep 的 tag 也放进来。
+        assert!(entry_score("ignore-0.4.33", "ignore 0.4.33", "ripgrep") < 0);
+        assert!(entry_score("nightly-20261031", "nightly", "ARMSX2") > 0);
+    }
+
+    #[test]
+    fn channel_detection() {
+        assert_eq!(util::channel_of("nightly-20261031").as_deref(), Some("nightly"));
+        // 展示用的格式化版本串（空格分隔）也要认出来。
+        assert_eq!(util::channel_of("nightly 20261031").as_deref(), Some("nightly"));
+        assert_eq!(util::channel_of("vSnapShot-2026.10").as_deref(), Some("snapshot"));
+        assert_eq!(util::channel_of("canary").as_deref(), Some("canary"));
+        // 未知前缀 + 日期尾巴，也算一条滚动线。
+        assert_eq!(util::channel_of("build-20261031").as_deref(), Some("build"));
+        // 这些不是滚动线：子 crate 版本、日期不在连字符后面、普通版本号。
+        assert_eq!(util::channel_of("ignore-0.4.33"), None);
+        assert_eq!(util::channel_of("mpv-lazy-20241013"), None);
+        assert_eq!(util::channel_of("deepx-0.2.113"), None);
+        assert_eq!(util::channel_of("v2.0.0-preview.7"), None);
     }
 
     #[test]
