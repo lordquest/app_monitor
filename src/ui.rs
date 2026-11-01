@@ -555,6 +555,16 @@ struct CtxMenu {
     text: String,
 }
 
+/// 语言下拉菜单是被哪一颗按钮拉起的：顶栏一颗、设置弹窗里一颗。
+///
+/// 菜单只记「哪一个」，坐标每帧从对应的 cell 现读 —— 窗口缩放或设置内容滚动
+/// 之后按钮会挪位置，存快照会让菜单悬在半空。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LangAnchor {
+    Top,
+    Set,
+}
+
 /// 选区的字节范围 → 可以放进剪贴板的字符串与字数。
 ///
 /// 两端都要 snap：鼠标落在字形中间时 `index_at` 给出的是最近的字节索引，
@@ -649,9 +659,9 @@ pub struct App {
     queue_show: bool,
     /// 悬停浮出的下载详情，见 [`DlPop`]。
     dl_pop: Option<DlPop>,
-    /// 语言下拉菜单。打开时存**锚点按钮**绘制时的 bounds（窗口坐标），菜单贴着
-    /// 它的右下角画。`None` 表示收起。
-    lang_menu: Option<Bounds<Pixels>>,
+    /// 语言下拉菜单。打开时记下**是哪一个按钮**拉起的，菜单每帧去读那颗按钮的
+    /// bounds 再定位。`None` 表示收起。
+    lang_menu: Option<LangAnchor>,
     /// 顶栏与设置弹窗里那两颗语言按钮各自的 bounds，绘制阶段回填。
     ///
     /// 两处分开记而不是共用一个：设置弹窗关掉之后弹窗里那颗不再绘制，共用的话
@@ -2169,7 +2179,12 @@ impl App {
                 }),
             ))
             .child(
-                self.lang_picker("btn-lang-top", self.lang_anchor_top.clone(), cx),
+                self.lang_picker(
+                    "btn-lang-top",
+                    LangAnchor::Top,
+                    self.lang_anchor_top.clone(),
+                    cx,
+                ),
             )
     }
 
@@ -2185,6 +2200,7 @@ impl App {
     fn lang_picker(
         &self,
         id: &'static str,
+        slot: LangAnchor,
         geom: Rc<RefCell<Option<Bounds<Pixels>>>>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2225,21 +2241,21 @@ impl App {
                             .child("▼"),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let anchor = *cell_click.borrow();
-                        this.toggle_lang_menu(anchor, cx);
+                        let has = cell_click.borrow().is_some();
+                        this.toggle_lang_menu(slot, has, cx);
                     })),
             )
     }
 
     /// 开/关语言菜单。锚点还没量到（理论上不会 —— 点击一定发生在绘制之后）
     /// 就当作没点，免得菜单在一个猜出来的坐标上冒出来。
-    fn toggle_lang_menu(&mut self, anchor: Option<Bounds<Pixels>>, cx: &mut Context<Self>) {
+    fn toggle_lang_menu(&mut self, slot: LangAnchor, has: bool, cx: &mut Context<Self>) {
         if self.lang_menu.take().is_some() {
             cx.notify();
             return;
         }
-        if anchor.is_some() {
-            self.lang_menu = anchor;
+        if has {
+            self.lang_menu = Some(slot);
             cx.notify();
         }
     }
@@ -2265,7 +2281,16 @@ impl App {
     /// 任何地方都只是收起菜单，不会漏给下面的按钮 —— 尤其是别再点一次那颗
     /// 按钮，否则「点开 / 点关」会连成两次 toggle。
     fn lang_menu_layer(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> AnyElement {
-        let Some(anchor) = self.lang_menu else {
+        let Some(slot) = self.lang_menu else {
+            return div().into_any_element();
+        };
+        // 每帧重新读锚点，而不是在打开时存一份快照：窗口一缩放（或设置里的内容
+        // 滚了一屏），按钮就换了位置，快照会让菜单挂在半空。
+        let cell = match slot {
+            LangAnchor::Top => &self.lang_anchor_top,
+            LangAnchor::Set => &self.lang_anchor_set,
+        };
+        let Some(anchor) = *cell.borrow() else {
             return div().into_any_element();
         };
         let following = self.cfg.lang.trim().is_empty();
@@ -4227,7 +4252,12 @@ impl App {
                     .gap_2()
                     // 和顶栏那颗同一个控件：语言一多，一排按钮立刻摊不开，
                     // 两处都收成下拉，新语言只需要往 `Lang` 里加一项。
-                    .child(self.lang_picker("btn-lang-set", self.lang_anchor_set.clone(), cx))
+                    .child(self.lang_picker(
+                        "btn-lang-set",
+                        LangAnchor::Set,
+                        self.lang_anchor_set.clone(),
+                        cx,
+                    ))
                     .child(
                         div()
                             .text_size(sp(12.))
