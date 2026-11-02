@@ -242,12 +242,15 @@ fn push_unique(out: &mut Vec<Track>, t: Track) {
 pub const DEFAULT_INPUT: &str = r#"https://github.com/itmisx/deepx-code  deepxcode
 https://github.com/nyakang/nyaterm  nyaterm
 https://github.com/Niko1221/Strata  strata
+https://github.com/binaricat/Netcatty
+https://github.com/ARMSX2/ARMSX2
+https://github.com/t8y2/motty
 https://www.423down.com/
 CrystalDiskInfo
-微信电脑版
 7-Zip
 https://masuit.org/
 HWiNFO
+微信电脑版 防撤回绿色版
 https://www.pc528.net/
 Windows11 26H2  不忘初心游戏版
 https://github.com/hooke007/mpv_PlayKit/releases  mpv-lazy @scene#54:"日常开发"
@@ -260,22 +263,39 @@ mod tests {
     #[test]
     fn parses_the_full_paste() {
         let p = parse_input(DEFAULT_INPUT);
-        assert_eq!(p.tracks.len(), 9, "{:?}", p.tracks.iter().map(|t| &t.name).collect::<Vec<_>>());
+        assert_eq!(p.tracks.len(), 12, "{:?}", p.tracks.iter().map(|t| &t.name).collect::<Vec<_>>());
+        assert!(p.skipped.is_empty(), "{:?}", p.skipped);
         let gh: Vec<_> = p.tracks.iter().filter(|t| t.kind == SourceKind::GitHub).collect();
-        assert_eq!(gh.len(), 4);
-        assert!(gh.iter().any(|t| t.url == "https://github.com/itmisx/deepx-code"));
-        assert!(gh.iter().any(|t| t.name == "mpv-lazy" && t.group == "日常开发"));
+        assert_eq!(gh.len(), 7);
         let site: Vec<_> = p.tracks.iter().filter(|t| t.kind == SourceKind::Site).collect();
         assert_eq!(site.len(), 5);
-        assert!(site
+    }
+
+    /// 随包发的清单就是维护者自己在用的那份，所以这里逐条钉住 —— 改 [`DEFAULT_INPUT`]
+    /// 时不会不知不觉漏掉一行，或者把某个名字挂到别的站点下面。
+    #[test]
+    fn default_list_is_the_maintainers_list() {
+        let parsed = parse_input(DEFAULT_INPUT);
+        let got: Vec<(&str, &str, &str)> = parsed
+            .tracks
             .iter()
-            .any(|t| t.name == "微信电脑版" && t.url.contains("423down")));
-        assert!(site
-            .iter()
-            .any(|t| t.name == "HWiNFO" && t.url.contains("masuit")));
-        assert!(site
-            .iter()
-            .any(|t| t.name == "Windows11 26H2 不忘初心游戏版" && t.url.contains("pc528")));
+            .map(|t| (t.name.as_str(), t.url.as_str(), t.group.as_str()))
+            .collect();
+        let want = [
+            ("deepxcode", "https://github.com/itmisx/deepx-code", "GitHub 项目"),
+            ("nyaterm", "https://github.com/nyakang/nyaterm", "GitHub 项目"),
+            ("strata", "https://github.com/Niko1221/Strata", "GitHub 项目"),
+            ("Netcatty", "https://github.com/binaricat/Netcatty", "GitHub 项目"),
+            ("ARMSX2", "https://github.com/ARMSX2/ARMSX2", "GitHub 项目"),
+            ("motty", "https://github.com/t8y2/motty", "GitHub 项目"),
+            ("CrystalDiskInfo", "https://www.423down.com", "软件站"),
+            ("7-Zip", "https://www.423down.com", "软件站"),
+            ("HWiNFO", "https://masuit.org", "软件站"),
+            ("微信电脑版 防撤回绿色版", "https://masuit.org", "软件站"),
+            ("Windows11 26H2 不忘初心游戏版", "https://www.pc528.net", "系统镜像"),
+            ("mpv-lazy", "https://github.com/hooke007/mpv_PlayKit", "日常开发"),
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]
