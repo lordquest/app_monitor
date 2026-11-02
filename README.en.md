@@ -217,6 +217,9 @@ With it on, startup logs a warning that the payload may be replaced in transit.
 | `Ctrl+,` | Settings |
 | `Esc` | Close the dialog |
 
+The inputs also have a right-click menu (Cut / Copy / Paste / Select all) and `Ctrl+C` / `Ctrl+X`. With no
+selection both are no-ops — select first with `Ctrl+A` or the menu's Select all.
+
 ## Command-line self-check
 
 ```bash
@@ -246,6 +249,7 @@ AM_LOG=1 app-monitor              # turn on debug logging
 AM_ALLOW_DOWNGRADE=1 app-monitor  # allow https → http downgrades for downloads (escape hatch, see above)
 AM_START_DIALOG=settings app-monitor   # open a dialog at startup: add / settings / history (screenshots and repros)
 AM_LOG_MOUSE=1 app-monitor        # print mouse-down events and the scale factor to stderr ("I clicked and nothing happened")
+AM_LOG_KEY=1 app-monitor          # print every keystroke that reaches an input box to stderr ("typing does nothing")
 AM_LANG=ja app-monitor            # switch the UI language for this run: zh / en / ja / ko (does not write config.json)
 AM_UI_SCALE=1.3 app-monitor       # run the UI at 130% for this run (does not write config.json)
 AM_GPUI_FAKE_DL=1 app-monitor     # inject a fake "downloading" task: no requests, no history — just to check the bar and the hover card layout
@@ -255,14 +259,15 @@ AM_GPUI_FAKE_DL=1 app-monitor     # inject a fake "downloading" task: no request
 
 GPUI 0.2 ships no text widget, so the inputs in **add track / settings / filter** are written from scratch:
 
-- printable characters, backspace, Delete, left/right / Home / End, **Ctrl+V paste**, and Ctrl+A followed by typing replaces the selection;
+- printable characters (space included), backspace, Delete, left/right / Home / End, **Ctrl+V paste**, Ctrl+C copy, Ctrl+X cut, and Ctrl+A followed by typing replaces the selection;
+- **right-click menu**: Cut / Copy / Paste / Select all. The first two are greyed out with no selection, same as a native text box; after Select all the text gets a light blue highlight (dot-masked fields such as the token are not highlighted, but Copy still yields the real text);
 - **no IME support**: these three fields hold URLs, directories, tokens and proxy addresses — all ASCII. Pasting is unaffected by keyboard layout, and track names are derived from URLs, so no one needs to type CJK here;
 - the editing logic lives in `EditState` (plain strings, no window), so the error-prone parts — UTF-8 boundaries, CRLF normalisation — are covered by unit tests.
 
 ### Two pitfalls with key bindings
 
 - `Window::on_action` can only be registered while the dispatch tree is being built (i.e. during element rendering). Registering right after the window is created makes `key_dispatch.rs` `unwrap()` a `None` and panic. The listener therefore hangs off the root element's `.on_action(...)`.
-- With no focusable element, key dispatch has an empty `active_node` and panics as well. The root element calls `track_focus` and holds focus while no dialog is open; opening a dialog hands focus to the input.
+- With no focusable element, key dispatch has an empty `active_node` and panics as well. The root element therefore calls `track_focus`: opening a dialog hands focus to its input, closing one takes focus back to the root. That hand-back happens **only at the moment the dialog closes** (`refocus_root`). The earlier rule — "take focus back whenever the root is not focused" — was wrong: any focused input leaves the root unfocused, so the sidebar filter lost focus after a single keystroke.
 
 ### Layout: wrapped text needs a definite width
 

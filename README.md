@@ -221,6 +221,9 @@ AM_ALLOW_DOWNGRADE=1 app-monitor    # Windows: set AM_ALLOW_DOWNGRADE=1 && app-m
 | `Ctrl+,` | 设置 |
 | `Esc` | 关闭弹窗 |
 
+输入框里还有一套右键菜单（剪切 / 复制 / 粘贴 / 全选），以及 `Ctrl+C` / `Ctrl+X` —— 没有选区时
+复制与剪切是空操作，先用 `Ctrl+A` 或右键「全选」选起来。
+
 ## 命令行自测
 
 ```bash
@@ -255,6 +258,7 @@ AM_LOG=1 app-monitor              # 打开调试日志
 AM_ALLOW_DOWNGRADE=1 app-monitor  # 下载允许 https → http 降级（逃生阀，见上一节）
 AM_START_DIALOG=settings app-monitor   # 启动即打开弹窗：add / settings / history（截图与复现用）
 AM_LOG_MOUSE=1 app-monitor        # 把鼠标按下事件与缩放因子打到 stderr，排查「点了没反应」
+AM_LOG_KEY=1 app-monitor          # 把到达输入框的按键打到 stderr，排查「敲不进去」
 AM_LANG=en app-monitor            # 临时切界面语言：zh / en / ja / ko（不写 config.json）
 AM_UI_SCALE=1.3 app-monitor       # 临时按 130% 缩放界面（不写 config.json）
 AM_GPUI_FAKE_DL=1 app-monitor     # 塞一条假的「进行中」任务：不发请求、不写历史，只看进度条与悬停详情的排版
@@ -264,7 +268,10 @@ AM_GPUI_FAKE_DL=1 app-monitor     # 塞一条假的「进行中」任务：不�
 
 GPUI 0.2 没有内置文本控件，所以「添加追踪 / 设置 / 筛选」三处的输入框是自己实现的：
 
-- 支持可打印字符、退格、Delete、左右 / Home / End、**Ctrl+V 粘贴**、Ctrl+A 全选后再输入即替换；
+- 支持可打印字符（含空格）、退格、Delete、左右 / Home / End、**Ctrl+V 粘贴**、Ctrl+C 复制、
+  Ctrl+X 剪切、Ctrl+A 全选后再输入即替换；
+- **右键有菜单**：剪切 / 复制 / 粘贴 / 全选。没有选区时前两项置灰，与系统文本框一致；
+  全选之后那一段会有浅蓝高亮（Token 这类用圆点渲染的框不画高亮，但复制出来的仍是原文）；
 - **不走输入法（IME）**：这三处填的是 URL、目录、Token、代理地址，全是 ASCII；粘进来也不受
   键盘布局影响。追踪项的名称由 URL 推导，不需要手工键入中文。
 - 编辑逻辑抽成了 `EditState`（纯字符串、不碰窗口），因此 UTF-8 边界、CRLF 归一这些容易出错的
@@ -276,7 +283,9 @@ GPUI 0.2 没有内置文本控件，所以「添加追踪 / 设置 / 筛选」�
   在 `key_dispatch.rs` 里 `unwrap()` 到 `None` 直接 panic。所以 action 监听挂在根元素的
   `.on_action(...)` 上。
 - 一个可聚焦元素都没有时，按键派发的 `active_node` 为空，同样会 panic。根元素因此也
-  `track_focus`，并在没有弹窗时持有焦点；打开弹窗则把焦点交给输入框。
+  `track_focus`；打开弹窗把焦点交给输入框，关掉弹窗再把焦点收回根节点。这一步**只在关弹窗
+  那一刻做**（`refocus_root`）—— 早先写成「根节点没有焦点就抢回来」，而任何输入框聚焦时
+  根节点本来就没有焦点，于是主界面的筛选框敲一个字就被抢走焦点。
 
 ### 布局：换行文本必须给确定宽度
 

@@ -430,6 +430,36 @@ impl EditState {
     fn select_all(&mut self) {
         self.selection = Some((0, self.text.len()));
     }
+
+    /// 选区里的文字与字数。空选区返回 `None` —— 复制、剪切靠它判断能不能用。
+    ///
+    /// 两端都过一遍 `snap_to_char`：日韩文字是多字节的，切在中间会 panic。
+    fn selected(&self) -> Option<(String, usize)> {
+        let (a, b) = self.selection?;
+        let a = crate::select_text::snap_to_char(&self.text, a.min(b));
+        let b = crate::select_text::snap_to_char(&self.text, a.max(b));
+        if a >= b {
+            return None;
+        }
+        let text = self.text.get(a..b)?.to_string();
+        let n = text.chars().count();
+        Some((text, n))
+    }
+
+    /// 删掉选区并把光标放回起点。
+    fn cut_selection(&mut self) -> bool {
+        let Some((a, b)) = self.selection.take() else {
+            return false;
+        };
+        let a = crate::select_text::snap_to_char(&self.text, a.min(b));
+        let b = crate::select_text::snap_to_char(&self.text, a.max(b));
+        if a >= b {
+            return false;
+        }
+        self.text.replace_range(a..b, "");
+        self.cursor = a;
+        true
+    }
 }
 
 struct TextField {
@@ -498,6 +528,14 @@ impl TextField {
     fn select_all(&mut self) {
         self.edit.select_all();
     }
+
+    fn selected(&self) -> Option<(String, usize)> {
+        self.edit.selected()
+    }
+
+    fn cut_selection(&mut self) -> bool {
+        self.edit.cut_selection()
+    }
 }
 
 /// 复制按钮的回执文案：「已复制 **什么**」里的那个什么。
@@ -553,6 +591,26 @@ struct CtxMenu {
     y: f32,
     owner: String,
     text: String,
+}
+
+/// 文本输入框上右键弹出的菜单。
+///
+/// 与 [`CtxMenu`] 分开是因为两者能做的事不一样：那个菜单作用于**只读正文**的
+/// 选区（复制 / 全选 / 取消选择），这个要改输入框的内容（剪切 / 粘贴），而且
+/// 得记住作用于哪一个框。坐标口径与 `CtxMenu` 相同：窗口坐标下的逻辑像素。
+struct FieldCtx {
+    field: FieldId,
+    x: f32,
+    y: f32,
+}
+
+/// 输入框右键菜单里的四个动作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldAct {
+    Cut,
+    Copy,
+    Paste,
+    All,
 }
 
 /// 语言下拉菜单是被哪一颗按钮拉起的：顶栏一颗、设置弹窗里一颗。
@@ -636,6 +694,9 @@ pub struct App {
     /// 待聚焦的输入框。事件回调里拿不到 `&mut Window`，只能等下一帧在
     /// `render` 里真正把焦点交出去。
     pending_focus: Option<FieldId>,
+    /// 下一帧把焦点交还给根节点。只有关弹窗时才置位 —— 弹窗里的输入框不再绘制，
+    /// 焦点悬空会让快捷键全部失灵。
+    refocus_root: bool,
     /// 根节点的焦点句柄。GPUI 的键盘派发要靠「当前有焦点的节点」铺 dispatch
     /// 路径，一个可聚焦元素都没有时按快捷键会 panic（active_node 为空）。
     root_focus: gpui::FocusHandle,
@@ -671,6 +732,8 @@ pub struct App {
     /// 选区上右键弹出的菜单。松手即复制之外再给一条显式路径：用户习惯先选中、
     /// 再右键点「复制」，缺了它就会被当成「这个界面不能复制」。
     ctx: Option<CtxMenu>,
+    /// 输入框上右键弹出的菜单（剪切 / 复制 / 粘贴 / 全选）。`None` 表示收起。
+    field_ctx: Option<FieldCtx>,
 }
 
 impl App {
@@ -749,6 +812,7 @@ impl App {
             set_token,
             active_field: None,
             pending_focus: None,
+            refocus_root: false,
             root_focus: cx.focus_handle(),
             add_skipped: Vec::new(),
             confirm_delete: None,
@@ -757,6 +821,7 @@ impl App {
             sel: None,
             sel_geom: Rc::new(RefCell::new(None)),
             ctx: None,
+            field_ctx: None,
             queue_show: false,
             dl_pop: None,
             lang_menu: None,
@@ -1271,6 +1336,10 @@ impl App {
     /// 一个够用的单行编辑器：可打印字符、退格、删除、方向键、Ctrl+A / Ctrl+V。
     fn on_field_key(&mut self, id: FieldId, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // AM_LOG_KEY=1：把到达输入框的按键打到 stderr，排查「敲不进去」时用。
+        if std::env::var_os("AM_LOG_KEY").is_some() {
+            eprintln!("[key] {id:?} key={:?} char={:?}", ks.key, ks.key_char);
+        }
         let cmd = ks.modifiers.platform || ks.modifiers.control;
         let mut handled = true;
 
@@ -1278,6 +1347,10 @@ impl App {
             if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
                 self.field_mut(id).insert(&text);
             }
+        } else if cmd && ks.key == "c" {
+            self.field_copy(id, false, cx);
+        } else if cmd && ks.key == "x" {
+            self.field_copy(id, true, cx);
         } else if cmd && ks.key == "a" {
             self.field_mut(id).select_all();
         } else if cmd {
@@ -1290,6 +1363,11 @@ impl App {
                 "right" => self.field_mut(id).move_right(),
                 "home" => self.field_mut(id).home(),
                 "end" => self.field_mut(id).end(),
+                // 空格是 GPUI 里的「命名的键」：`key` 是 "space"，`key_char` 是
+                // None（Windows 后端的 `parse_immutable` 先把它认走了，只有模拟
+                // 输入才会补 `key_char`）。所以它走不到下面那条通用分支，不单独
+                // 认一下，输入框里就敲不出空格。
+                "space" => self.field_mut(id).insert(" "),
                 // 添加弹窗里 Enter 直接提交（多行粘贴不受影响，那是 Ctrl+V 进来的）。
                 "enter" if id == FieldId::AddInput => {
                     self.submit_add(cx);
@@ -1336,6 +1414,7 @@ impl App {
         // 弹窗一开，设置里那颗按钮就换了位置（甚至被盖住），菜单还挂在旧坐标上
         // 会悬在窗口中间。语言本身已经落盘，直接收起即可。
         self.lang_menu = None;
+        self.field_ctx = None;
         cx.notify();
     }
 
@@ -1343,6 +1422,8 @@ impl App {
         self.dialog = None;
         self.active_field = None;
         self.lang_menu = None;
+        self.field_ctx = None;
+        self.refocus_root = true;
         cx.notify();
     }
 
@@ -1418,6 +1499,8 @@ impl App {
             self.select(&id, cx);
         }
         self.dialog = None;
+        self.field_ctx = None;
+        self.refocus_root = true;
         self.toast(
             if dup > 0 {
                 tf!(
@@ -1459,6 +1542,8 @@ impl App {
         self.http = http;
         crate::store::write_config(&self.cfg);
         self.dialog = None;
+        self.field_ctx = None;
+        self.refocus_root = true;
         self.toast(t("设置已保存", "Settings saved"), cx);
     }
 
@@ -1700,6 +1785,68 @@ impl App {
         self.copy(picked, What::Selection(n), cx);
     }
 
+    // -- 输入框的右键菜单 --------------------------------------------------
+
+    /// 输入框上右键。两个菜单互斥：同一时刻屏幕上只该有一张。
+    fn open_field_ctx(&mut self, field: FieldId, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.ctx = None;
+        self.field_ctx = Some(FieldCtx { field, x, y });
+        cx.notify();
+    }
+
+    fn close_field_ctx(&mut self, cx: &mut Context<Self>) {
+        if self.field_ctx.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 复制 / 剪切输入框里的选区。
+    ///
+    /// 没有选区就什么也不做 —— 与 Windows 的文本框一致（Ctrl+C 在空选区下静默），
+    /// 菜单里这两项也会跟着置灰。输入框没有拖选，选区只能来自 Ctrl+A 或菜单里的
+    /// 「全选」，所以范围要么是空的、要么是整段。
+    fn field_copy(&mut self, field: FieldId, cut: bool, cx: &mut Context<Self>) {
+        let Some((text, n)) = self.field(field).selected() else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        if cut {
+            self.field_mut(field).cut_selection();
+            self.toast(tf!("已剪切{}", "Cut {}", What::Selection(n).label()), cx);
+        } else {
+            self.toast(
+                tf!("已复制{}", "Copied {}", What::Selection(n).label()),
+                cx,
+            );
+        }
+    }
+
+    /// 右键菜单里某一项的落地动作。
+    fn field_act(&mut self, field: FieldId, act: FieldAct, cx: &mut Context<Self>) {
+        self.field_ctx = None;
+        match act {
+            FieldAct::Cut => self.field_copy(field, true, cx),
+            FieldAct::Copy => self.field_copy(field, false, cx),
+            FieldAct::Paste => {
+                match cx.read_from_clipboard().and_then(|c| c.text()) {
+                    Some(text) => {
+                        self.field_mut(field).insert(&text);
+                        cx.notify();
+                    }
+                    None => self.toast(
+                        t("剪贴板里没有文字", "The clipboard has no text"),
+                        cx,
+                    ),
+                }
+            }
+            FieldAct::All => {
+                // 选完之后把焦点也给它：接着按 Ctrl+C 就该走这颗框。
+                self.field_mut(field).select_all();
+                self.focus_field(field, cx);
+            }
+        }
+    }
+
     // -- 选区的右键菜单 ----------------------------------------------------
 
     fn open_ctx(
@@ -1711,6 +1858,7 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         self.ctx = Some(CtxMenu { x, y, owner, text });
+        self.field_ctx = None;
         cx.notify();
     }
 
@@ -1861,6 +2009,98 @@ impl App {
                                                 Act::All => this.ctx_select_all(cx),
                                                 Act::Clear => this.ctx_clear(cx),
                                             }
+                                        }),
+                                    )
+                            })
+                            .child(label)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// 输入框右键菜单层。做法与 [`Self::ctx_layer`] 相同：一层透明遮罩接住
+    /// 「点别处」，菜单画在它上面、贴着鼠标右下方，贴边时往里收。
+    fn field_ctx_layer(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu) = self.field_ctx.as_ref() else {
+            return div().into_any_element();
+        };
+        let field = menu.field;
+        let tf = self.field(field);
+        // 与 Windows 的文本框一致：没有选区时「剪切 / 复制」置灰；输入框是空的
+        // 时候「全选」也没有意义。
+        let has_sel = tf.selected().is_some();
+        let has_text = !tf.text().is_empty();
+        let items: [(FieldAct, &'static str, bool); 4] = [
+            (FieldAct::Cut, t("剪切", "Cut"), has_sel),
+            (FieldAct::Copy, t("复制", "Copy"), has_sel),
+            (FieldAct::Paste, t("粘贴", "Paste"), true),
+            (FieldAct::All, t("全选", "Select all"), has_text),
+        ];
+        let w = 148. * scale();
+        let h = (items.len() as f32 * 34. + 12.) * scale();
+        let x = menu.x.min((vw - w - 8.).max(8.)).max(8.);
+        let y = if menu.y + h + 8. > vh {
+            (menu.y - h).max(8.)
+        } else {
+            menu.y
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                div()
+                    .id("field-ctx-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_field_ctx(cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_field_ctx(cx);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("field-ctx-menu")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .py(px(6. * scale()))
+                    .rounded_md()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .children(items.into_iter().enumerate().map(|(i, (act, label, enabled))| {
+                        let color = if enabled { TEXT } else { FAINT };
+                        div()
+                            .id(SharedString::from(format!("field-ctx-item-{i}")))
+                            .px_3()
+                            .py(px(7. * scale()))
+                            .text_size(sp(13.))
+                            .text_color(rgb(color))
+                            .whitespace_nowrap()
+                            .when(enabled, |d| {
+                                d.cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.field_act(field, act, cx);
                                         }),
                                     )
                             })
@@ -3448,8 +3688,11 @@ impl Render for App {
         if let Some(field) = self.pending_focus.take() {
             let focus = self.field(field).focus.clone();
             focus.focus(window);
-        } else if self.dialog.is_none() && !self.root_focus.is_focused(window) {
-            // 关掉弹窗后焦点会悬空，快捷键随之失效，交还给根节点。
+        } else if std::mem::take(&mut self.refocus_root) {
+            // 关掉弹窗后焦点会悬空（元素已经不绘制了），快捷键随之失效，交还给
+            // 根节点。**只在刚关弹窗的那一刻做**：早先这里写的是「根节点没有焦点
+            // 就抢回来」，而任何输入框聚焦时根节点本来就没有焦点 —— 于是主界面的
+            // 筛选框敲一个字就会被抢走焦点，第二下再也进不去。
             self.root_focus.focus(window);
         }
         // 窗口标题跟着语言走。`&mut Window` 只有绘制阶段拿得到，所以按需设一次，
@@ -3659,6 +3902,9 @@ impl Render for App {
                     )
             }))
             .child(self.dialog_layer(px((vh * 0.9).max(320.)), cx))
+            // 输入框的右键菜单：它由弹窗里的某颗输入框拉起，必须压在弹窗之上，
+            // 否则菜单会被半透明的遮罩压暗、还挡不住下面那颗按钮。
+            .child(self.field_ctx_layer(vw, vh, cx))
             // 菜单压在所有东西之上：它是「此刻唯一可点的东西」，被弹窗或 toast
             // 挡住的话用户会以为右键没生效。
             .child(self.ctx_layer(vw, vh, cx))
@@ -3901,6 +4147,56 @@ impl App {
         let color = if empty && !focused { FAINT } else { TEXT };
         let height = if tf.multiline { sp(78.) } else { sp(30.) };
         let focus = tf.focus.clone();
+        // 输入框没有拖选，选区只可能来自 Ctrl+A 或右键「全选」，所以要么是整段、
+        // 要么没有。Token 用圆点渲染，字节偏移换算不过去，索性不画高亮。
+        let selection = tf
+            .edit
+            .selection
+            .filter(|_| focused && !tf.secret)
+            .map(|(a, b)| (a.min(b), a.max(b)))
+            .filter(|(a, b)| a < b);
+        // 光标那个竖线插在 `cursor` 处、自己占一个字节：落在它之后的偏移都要往后
+        // 挪一位，否则高亮会从中间断开一格。
+        let cursor = tf.edit.cursor.min(tf.text().len());
+        let total = body.len();
+        let highlight = selection
+            .map(|(a, b)| {
+                let map = |o: usize| if o > cursor { o + 1 } else { o };
+                (map(a), map(b))
+            })
+            .filter(|(a, b)| a < b && *b <= total);
+        let content: AnyElement = match highlight {
+            Some((a, b)) => {
+                let font = gpui::Font {
+                    family: SharedString::from(ui_font().to_string()),
+                    features: gpui::FontFeatures::default(),
+                    fallbacks: None,
+                    weight: FontWeight::NORMAL,
+                    style: gpui::FontStyle::Normal,
+                };
+                let run = |len: usize, bg: Option<gpui::Hsla>| gpui::TextRun {
+                    len,
+                    font: font.clone(),
+                    color: rgb(TEXT).into(),
+                    background_color: bg,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let mut runs = Vec::with_capacity(3);
+                if a > 0 {
+                    runs.push(run(a, None));
+                }
+                // 与正文选区同一个口径（主色 25%）：浅底上够看清，又不会把字糊住。
+                runs.push(run(b - a, Some(gpui::rgba(0x2563EB40).into())));
+                if b < total {
+                    runs.push(run(total - b, None));
+                }
+                gpui::StyledText::new(body)
+                    .with_runs(runs)
+                    .into_any_element()
+            }
+            None => div().child(body).into_any_element(),
+        };
 
         div()
             .id(SharedString::from(format!("input-{field:?}")))
@@ -3918,8 +4214,18 @@ impl App {
             .overflow_hidden()
             .cursor_text()
             .track_focus(&focus)
-            .child(body)
+            .child(content)
             .on_click(cx.listener(move |this, _, _, cx| this.focus_field(field, cx)))
+            // 右键菜单：剪切 / 复制 / 粘贴 / 全选。事件停在这里，否则会冒泡给
+            // 弹窗底下那层，被当成「点别处」处理掉。
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.focus_field(field, cx);
+                    this.open_field_ctx(field, ev.position.x.into(), ev.position.y.into(), cx);
+                }),
+            )
             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
                 this.on_field_key(field, ev, cx)
             }))
@@ -4746,6 +5052,40 @@ mod tests {
         e.insert("b", false);
         assert_eq!(e.text, "abc");
         assert_eq!(e.cursor, 2);
+    }
+
+    #[test]
+    fn space_is_inserted_like_any_other_char() {
+        // 空格在 GPUI 里走的是命名的键（`key` = "space"），键盘层补一个字面量进来，
+        // 这条只保证编辑器本身不挑字符。
+        let mut e = EditState::new("a b");
+        e.insert(" ", false);
+        assert_eq!(e.text, "a b ");
+        assert_eq!(e.cursor, 4);
+    }
+
+    #[test]
+    fn select_all_then_cut_empties_the_field() {
+        let mut e = EditState::new("https://a/b");
+        assert!(e.selected().is_none(), "没选之前没有可复制的");
+        e.select_all();
+        let (text, n) = e.selected().expect("全选之后整段都是选区");
+        assert_eq!(text, "https://a/b");
+        assert_eq!(n, 11);
+        assert!(e.cut_selection());
+        assert_eq!(e.text, "");
+        assert_eq!(e.cursor, 0);
+        assert!(!e.cut_selection(), "再切一次已经没有选区可切");
+    }
+
+    #[test]
+    fn selected_snaps_multibyte_offsets() {
+        // 偏移落在「中」中间时必须退回字符边界，否则 `get(..)` 会 panic。
+        let mut e = EditState::new("中文");
+        e.selection = Some((1, 6));
+        let (text, n) = e.selected().expect("两端都夹到边界后仍有一段");
+        assert_eq!(text, "中文");
+        assert_eq!(n, 2);
     }
 
     #[test]
