@@ -262,6 +262,7 @@ GPUI 0.2 ships no text widget, so the inputs in **add track / settings / filter*
 - printable characters (space included), backspace, Delete, left/right / Home / End, **Ctrl+V paste**, Ctrl+C copy, Ctrl+X cut, and Ctrl+A followed by typing replaces the selection;
 - **drag to select**: pressing the left button places the caret, and the selection follows the pointer as far as you drag — even out of the box and across the window (the root node keeps extending it). Shift + arrows / Home / End work too; backspace then removes only the selected range;
 - **right-click menu**: Cut / Copy / Paste / Select all. The first two are greyed out with no selection, same as a native text box; the selected range gets a light blue highlight (dot-masked fields such as the token are not highlighted, but Copy still yields the real text);
+- **blinking caret**: 500ms on, 500ms off, and any keystroke or caret move restarts the phase (a character you just typed never sits in the dark half). "Off" means the glyph is drawn fully transparent rather than removed — removing it would shift the rest of the line one character left every half second;
 - **no IME support**: these three fields hold URLs, directories, tokens and proxy addresses — all ASCII. Pasting is unaffected by keyboard layout, and track names are derived from URLs, so no one needs to type CJK here;
 - the editing logic lives in `EditState` (plain strings, no window), so the error-prone parts — UTF-8 boundaries, CRLF normalisation — are covered by unit tests.
 

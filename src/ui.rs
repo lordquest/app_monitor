@@ -51,6 +51,13 @@ const SCALE_MIN: f32 = 0.8;
 const SCALE_MAX: f32 = 1.8;
 const SCALE_STEP: f32 = 0.1;
 
+/// 输入光标的闪烁半周期：亮 500ms、灭 500ms，和主流编辑器的手感一致。
+///
+/// 光标本身不是画出来的矩形 —— 界面层自绘输入框，光标是拼进文本里的一个 `|`
+/// （见 `text_input`），所以「灭」是把那个字符的 run 调成透明而不是把它删掉：
+/// 删掉会让后面的字往左挪一格，闪起来整行都在抖。
+const CARET_HALF_MS: u128 = 500;
+
 pub fn set_ui_scale(s: f32) {
     let clamped = if s.is_finite() {
         s.clamp(SCALE_MIN, SCALE_MAX)
@@ -848,6 +855,11 @@ pub struct App {
     /// 浮层该收起的时刻。鼠标从条目挪到浮层要跨过几像素的缝，离开即收的话
     /// 用户永远点不到里面的行，所以给一小段宽限。
     done_pop_hide_at: Option<Instant>,
+    /// 插入点这一刻是不是亮的。相位由 [`App::spawn_caret_blink`] 每 100ms 校一次。
+    caret_on: bool,
+    /// 闪烁的相位起点。打字、移动光标、换焦点都把它拨到「现在」——
+    /// 否则刚敲完一个字光标可能恰好处在暗的那半秒里，看着像丢了。
+    caret_epoch: Instant,
 }
 
 impl App {
@@ -940,6 +952,8 @@ impl App {
             field_drag: None,
             done_pop: None,
             done_pop_hide_at: None,
+            caret_on: true,
+            caret_epoch: Instant::now(),
             queue_show: false,
             dl_pop: None,
             lang_menu: None,
@@ -947,6 +961,7 @@ impl App {
             lang_anchor_set: Rc::new(RefCell::new(None)),
         };
         app.spawn_pump(cx);
+        app.spawn_caret_blink(cx);
         if auto {
             app.resolve_all(cx);
         }
@@ -1060,6 +1075,49 @@ impl App {
             }
         })
         .detach();
+    }
+
+    /// 光标闪烁。每 100ms 校一次相位，跨过半周期才重绘一次 —— 与其按帧
+    /// 硬翻，不如用「现在离相位起点多久」算，按键重置相位后不用管下一次
+    /// 翻转落在哪儿。
+    fn spawn_caret_blink(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(|this: gpui::WeakEntity<App>, cx: &mut gpui::AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    let alive = this.update(&mut cx, |this, cx| {
+                        // 没有输入框在编辑时不用重绘，循环本身留着 —— 聚焦那一
+                        // 刻要能立刻跟上相位，不能等到下次按键才启动。
+                        if this.active_field.is_none() {
+                            return;
+                        }
+                        if this.caret_phase_on() != this.caret_on {
+                            this.caret_on = !this.caret_on;
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 相位：半周期亮、半周期暗。
+    fn caret_phase_on(&self) -> bool {
+        let ms = self.caret_epoch.elapsed().as_millis();
+        (ms % (CARET_HALF_MS * 2)) < CARET_HALF_MS
+    }
+
+    /// 把光标拉回「刚亮起」的状态。打字、移动光标、换焦点都走这里。
+    fn poke_caret(&mut self) {
+        self.caret_epoch = Instant::now();
+        self.caret_on = true;
     }
 
     fn drain(&mut self, cx: &mut Context<Self>) {
@@ -1523,6 +1581,7 @@ impl App {
         };
         self.field_mut(id).start_select(ix);
         self.field_drag = Some(id);
+        self.poke_caret();
         cx.notify();
     }
 
@@ -1542,6 +1601,7 @@ impl App {
         };
         let before = self.field(id).edit.selection;
         self.field_mut(id).extend_to(ix);
+        self.poke_caret();
         if self.field(id).edit.selection != before {
             cx.notify();
         }
@@ -1550,6 +1610,7 @@ impl App {
     fn end_field_drag(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.field_drag.take() {
             self.field_mut(id).end_select();
+            self.poke_caret();
             cx.notify();
         }
     }
@@ -1557,6 +1618,8 @@ impl App {
     fn focus_field(&mut self, id: FieldId, cx: &mut Context<Self>) {
         self.active_field = Some(id);
         self.pending_focus = Some(id);
+        // 刚点进来的光标要立刻亮着，而不是接着上一个框的相位半明半暗。
+        self.poke_caret();
         cx.notify();
     }
 
@@ -1636,6 +1699,7 @@ impl App {
             }
         }
         if handled {
+            self.poke_caret();
             cx.notify();
         }
     }
@@ -2078,6 +2142,7 @@ impl App {
                 match cx.read_from_clipboard().and_then(|c| c.text()) {
                     Some(text) => {
                         self.field_mut(field).insert(&text);
+                        self.poke_caret();
                         cx.notify();
                     }
                     None => self.toast(
@@ -4609,13 +4674,19 @@ impl App {
                 s.to_string()
             }
         };
+        let masked_before = mask(before);
+        let masked_after = mask(after);
+        // 插入点在 `body` 里的字节位置。不能拿原文偏移当索引 —— 密文是每个字
+        // 换成 3 字节的圆点，掩码后的长度和原文对不上。
+        let caret_at = masked_before.len();
         let body = if empty && !focused {
             placeholder.to_string()
         } else if focused {
             // 用竖线标出插入点：GPUI 0.2 的自绘光标要 Window 句柄，这里够用。
-            format!("{}|{}", mask(before), mask(after))
+            // 它在闪，见 `spawn_caret_blink`。
+            format!("{masked_before}|{masked_after}")
         } else {
-            format!("{}{}", mask(before), mask(after))
+            format!("{masked_before}{masked_after}")
         };
         let color = if empty && !focused { FAINT } else { TEXT };
         let height = if tf.multiline { sp(78.) } else { sp(30.) };
@@ -4638,37 +4709,59 @@ impl App {
                 (map(a), map(b))
             })
             .filter(|(a, b)| a < b && *b <= total);
-        let content: AnyElement = match highlight {
-            Some((a, b)) => {
-                let font = gpui::Font {
-                    family: SharedString::from(ui_font().to_string()),
-                    features: gpui::FontFeatures::default(),
-                    fallbacks: None,
-                    weight: FontWeight::NORMAL,
-                    style: gpui::FontStyle::Normal,
-                };
-                let run = |len: usize, bg: Option<gpui::Hsla>| gpui::TextRun {
-                    len,
-                    font: font.clone(),
-                    color: rgb(TEXT).into(),
-                    background_color: bg,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let mut runs = Vec::with_capacity(3);
-                if a > 0 {
-                    runs.push(run(a, None));
-                }
-                // 与正文选区同一个口径（主色 25%）：浅底上够看清，又不会把字糊住。
-                runs.push(run(b - a, Some(gpui::rgba(0x2563EB40).into())));
-                if b < total {
-                    runs.push(run(total - b, None));
-                }
-                gpui::StyledText::new(body)
-                    .with_runs(runs)
-                    .into_any_element()
+        // 光标那一段单独一个 run：亮时正文色，「灭」时全透明。
+        //
+        // 不把字符删掉是因为一删后面的字就往左跳一格，闪起来整行都在抖；透明只是
+        // 看不见，占位还在，文字位置纹丝不动。
+        let caret = focused.then_some(caret_at).filter(|c| *c < total);
+        let content: AnyElement = if highlight.is_some() || caret.is_some() {
+            let font = gpui::Font {
+                family: SharedString::from(ui_font().to_string()),
+                features: gpui::FontFeatures::default(),
+                fallbacks: None,
+                weight: FontWeight::NORMAL,
+                style: gpui::FontStyle::Normal,
+            };
+            // 切成段：开头 / 选区起 / 选区止 / 光标起 / 光标止 / 末尾，去重后逐段
+            // 决定颜色和底色。段边界天然有序，runs 的长度加起来正好是 total。
+            let mut cuts = vec![0usize, total];
+            if let Some((a, b)) = highlight {
+                cuts.push(a);
+                cuts.push(b);
             }
-            None => div().child(body).into_any_element(),
+            if let Some(c) = caret {
+                cuts.push(c);
+                cuts.push(c + 1);
+            }
+            cuts.retain(|v| *v <= total);
+            cuts.sort_unstable();
+            cuts.dedup();
+            let runs: Vec<gpui::TextRun> = cuts
+                .windows(2)
+                .filter(|w| w[0] < w[1])
+                .map(|w| {
+                    let (s, e) = (w[0], w[1]);
+                    let selected = highlight.is_some_and(|(a, b)| s >= a && e <= b);
+                    gpui::TextRun {
+                        len: e - s,
+                        font: font.clone(),
+                        color: if caret == Some(s) && !self.caret_on {
+                            gpui::hsla(0., 0., 0., 0.)
+                        } else {
+                            rgb(TEXT).into()
+                        },
+                        // 与正文选区同一个口径（主色 25%）：浅底上够看清，又不会把字糊住。
+                        background_color: selected.then(|| gpui::rgba(0x2563EB40).into()),
+                        underline: None,
+                        strikethrough: None,
+                    }
+                })
+                .collect();
+            gpui::StyledText::new(body)
+                .with_runs(runs)
+                .into_any_element()
+        } else {
+            div().child(body).into_any_element()
         };
 
         let geom = self.geom(field);
