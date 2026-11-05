@@ -21,9 +21,9 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App as GpuiApp, AppContext, Application, Bounds, Context, Div, FontWeight,
     InteractiveElement, KeyDownEvent,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder, px, relative,
-    rgb, size,
+    IntoElement, ParentElement, Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::FluentBuilder, px,
+    relative, rgb, size,
 };
 
 use crate::download::DlSpec;
@@ -145,6 +145,24 @@ struct DlPop {
     /// 追踪项的 id，用来确认浮层对应的任务还在。
     track: String,
     y: f32,
+}
+
+/// 鼠标停在一个**已经下过东西**的侧栏条目上时浮出的「已下载版本」清单。
+///
+/// 与 [`DlPop`] 分成两个类型而不是加个 `mode` 字段：前者是只读的进度播报，
+/// 后者每一行都能点（打开所在文件夹），生命周期也多一个「鼠标要能挪进来」的
+/// 问题，混在一起只会让两边都变难读。
+struct DonePop {
+    track: String,
+    y: f32,
+}
+
+/// 一个已经下完的版本，浮层里一行。
+struct DoneVersion {
+    version: String,
+    dir: String,
+    size: u64,
+    at: i64,
 }
 
 /// 这条子任务是不是还「没结束」（排队、进行中、暂停都算）。
@@ -324,8 +342,11 @@ struct EditState {
     text: String,
     /// 光标位置：字节偏移，始终落在 char 边界上。
     cursor: usize,
-    /// 全选区间（Ctrl+A 之后），下一次输入会整体替换。
+    /// 选区，**已排序**（`a <= b`）：下一次输入会整体替换、退格整体删掉。
     selection: Option<(usize, usize)>,
+    /// 拖选时固定不动的另一端。有了它，鼠标抖动或往回拖都能正确收窄选区 ——
+    /// 只记 `(起点, 当前)` 两个数在下一次移动时就没法区分谁是谁了。
+    anchor: Option<usize>,
 }
 
 impl EditState {
@@ -336,6 +357,7 @@ impl EditState {
             text,
             cursor,
             selection: None,
+            anchor: None,
         }
     }
 
@@ -343,6 +365,7 @@ impl EditState {
         self.text = text.into();
         self.cursor = self.text.len();
         self.selection = None;
+        self.anchor = None;
     }
 
     fn split(&self) -> (&str, &str) {
@@ -354,7 +377,9 @@ impl EditState {
     }
 
     fn insert(&mut self, s: &str, multiline: bool) {
+        self.anchor = None;
         if let Some((a, b)) = self.selection.take() {
+            let (a, b) = (a.min(b), a.max(b));
             self.text.replace_range(a..b, "");
             self.cursor = a;
         }
@@ -370,11 +395,12 @@ impl EditState {
     }
 
     fn backspace(&mut self) {
-        if self.selection.take().is_some() {
-            self.text.clear();
-            self.cursor = 0;
+        // 有选区时退格 = 删掉选区，而不是像早先那样把整段清空：那时选区只可能
+        // 来自 Ctrl+A，整段清空恰好等价；现在界面上能拖选出一段，就不等价了。
+        if self.cut_selection() {
             return;
         }
+        self.anchor = None;
         if self.cursor == 0 {
             return;
         }
@@ -387,6 +413,10 @@ impl EditState {
     }
 
     fn delete(&mut self) {
+        if self.cut_selection() {
+            return;
+        }
+        self.anchor = None;
         if self.cursor >= self.text.len() {
             return;
         }
@@ -397,38 +427,101 @@ impl EditState {
         self.text.replace_range(self.cursor..j, "");
     }
 
-    fn move_left(&mut self) {
+    /// 光标左边第一个字符的起始偏移。
+    fn prev_index(&self) -> usize {
         if self.cursor == 0 {
-            return;
+            return 0;
         }
         let mut i = self.cursor - 1;
         while i > 0 && !self.text.is_char_boundary(i) {
             i -= 1;
         }
-        self.cursor = i;
+        i
     }
 
-    fn move_right(&mut self) {
+    /// 光标右边第一个字符的结束偏移。
+    fn next_index(&self) -> usize {
         if self.cursor >= self.text.len() {
-            return;
+            return self.text.len();
         }
         let mut j = self.cursor + 1;
         while j < self.text.len() && !self.text.is_char_boundary(j) {
             j += 1;
         }
-        self.cursor = j;
+        j
     }
 
+    // 只在单测里直接调用这几个：界面上方向键走 `to_edge`（要认 Shift），
+    // 留着它们是给测试读起来更像「光标挪一格」。
+    #[cfg(test)]
+    fn move_left(&mut self) {
+        self.move_caret_to(self.prev_index(), false);
+    }
+
+    #[cfg(test)]
+    fn move_right(&mut self) {
+        self.move_caret_to(self.next_index(), false);
+    }
+
+    #[cfg(test)]
     fn home(&mut self) {
-        self.cursor = 0;
+        self.move_caret_to(0, false);
     }
 
+    #[cfg(test)]
     fn end(&mut self) {
-        self.cursor = self.text.len();
+        self.move_caret_to(self.text.len(), false);
+    }
+
+    /// 光标挪到 `ix`；`keep` 为真表示按住 Shift —— 从原来那端起一段选区。
+    fn move_caret_to(&mut self, ix: usize, keep: bool) {
+        let ix = crate::select_text::snap_to_char(&self.text, ix);
+        if keep {
+            self.select_to(ix);
+        } else {
+            self.cursor = ix;
+            self.selection = None;
+            self.anchor = None;
+        }
     }
 
     fn select_all(&mut self) {
         self.selection = Some((0, self.text.len()));
+        self.anchor = None;
+    }
+
+    /// 鼠标按下：光标落到落点上，从这儿开始拉选区（此时还没有选区）。
+    fn start_select(&mut self, ix: usize) {
+        let ix = crate::select_text::snap_to_char(&self.text, ix);
+        self.cursor = ix;
+        self.anchor = Some(ix);
+        self.selection = None;
+    }
+
+    /// 拖到 `ix`：锚点不动，光标跟着走，选区就是这两点之间。
+    fn extend_to(&mut self, ix: usize) {
+        self.select_to(ix);
+    }
+
+    /// Shift+方向键：锚点若还没有，就从当前光标起。
+    fn select_to(&mut self, ix: usize) {
+        let ix = crate::select_text::snap_to_char(&self.text, ix);
+        let anchor = self.anchor.unwrap_or(self.cursor);
+        self.anchor = Some(anchor);
+        self.cursor = ix;
+        self.selection = if anchor == ix {
+            None
+        } else {
+            Some((anchor.min(ix), anchor.max(ix)))
+        };
+    }
+
+    fn end_select(&mut self) {
+        self.anchor = None;
+    }
+
+    fn is_dragging(&self) -> bool {
+        self.anchor.is_some()
     }
 
     /// 选区里的文字与字数。空选区返回 `None` —— 复制、剪切靠它判断能不能用。
@@ -509,24 +602,34 @@ impl TextField {
         self.edit.delete();
     }
 
-    fn move_left(&mut self) {
-        self.edit.move_left();
-    }
-
-    fn move_right(&mut self) {
-        self.edit.move_right();
-    }
-
-    fn home(&mut self) {
-        self.edit.home();
-    }
-
-    fn end(&mut self) {
-        self.edit.end();
-    }
-
     fn select_all(&mut self) {
         self.edit.select_all();
+    }
+
+    fn start_select(&mut self, ix: usize) {
+        self.edit.start_select(ix);
+    }
+
+    fn extend_to(&mut self, ix: usize) {
+        self.edit.extend_to(ix);
+    }
+
+    fn end_select(&mut self) {
+        self.edit.end_select();
+    }
+
+    fn is_dragging(&self) -> bool {
+        self.edit.is_dragging()
+    }
+
+    /// 光标 / 选区（字节）换算成第几个字符 —— Token 这类框画的是圆点，一个点
+    /// 对应一个字，字节数对不上。
+    fn char_to_byte(&self, chars: usize) -> usize {
+        self.text()
+            .char_indices()
+            .nth(chars)
+            .map(|(i, _)| i)
+            .unwrap_or(self.text().len())
     }
 
     fn selected(&self) -> Option<(String, usize)> {
@@ -734,6 +837,17 @@ pub struct App {
     ctx: Option<CtxMenu>,
     /// 输入框上右键弹出的菜单（剪切 / 复制 / 粘贴 / 全选）。`None` 表示收起。
     field_ctx: Option<FieldCtx>,
+    /// 每个输入框绘制时的外框（窗口坐标）。鼠标落下时靠它把位置换算成字节偏移 ——
+    /// GPUI 的事件回调里拿不到元素自己的 bounds，只能在绘制阶段回填一次。
+    field_geom: [Rc<RefCell<Option<Bounds<Pixels>>>>; 5],
+    /// 正在拖选的输入框。拖出框外（甚至拖到别的一行上）也要继续选，所以从按下
+    /// 到松手之间一直记着是哪一个。
+    field_drag: Option<FieldId>,
+    /// 悬停浮出的「已下载版本」，见 [`DonePop`]。
+    done_pop: Option<DonePop>,
+    /// 浮层该收起的时刻。鼠标从条目挪到浮层要跨过几像素的缝，离开即收的话
+    /// 用户永远点不到里面的行，所以给一小段宽限。
+    done_pop_hide_at: Option<Instant>,
 }
 
 impl App {
@@ -822,6 +936,10 @@ impl App {
             sel_geom: Rc::new(RefCell::new(None)),
             ctx: None,
             field_ctx: None,
+            field_geom: std::array::from_fn(|_| Rc::new(RefCell::new(None))),
+            field_drag: None,
+            done_pop: None,
+            done_pop_hide_at: None,
             queue_show: false,
             dl_pop: None,
             lang_menu: None,
@@ -1068,6 +1186,16 @@ impl App {
                     if let Some(task) = snap {
                         self.record_history(&task, RecordStatus::Canceled, None);
                     }
+                    changed = true;
+                }
+            }
+        }
+        // 悬停浮层的宽限到期就收起来。借用这个 150ms 的泵而不是为浮层单开一个
+        // 定时器：浮层只在鼠标悬停时存在，多开一个后台任务不值当。
+        if let Some(at) = self.done_pop_hide_at {
+            if Instant::now() >= at {
+                self.done_pop_hide_at = None;
+                if self.done_pop.take().is_some() {
                     changed = true;
                 }
             }
@@ -1327,6 +1455,105 @@ impl App {
         }
     }
 
+    /// 输入框在 `field_geom` 里的槽位。顺序与 [`Self::field`] 一一对应。
+    fn field_slot(id: FieldId) -> usize {
+        match id {
+            FieldId::AddInput => 0,
+            FieldId::Filter => 1,
+            FieldId::DownloadDir => 2,
+            FieldId::Proxy => 3,
+            FieldId::Token => 4,
+        }
+    }
+
+    /// 这个输入框上一帧画在哪儿（窗口坐标）。还没画过就是 `None`。
+    fn geom(&self, id: FieldId) -> Rc<RefCell<Option<Bounds<Pixels>>>> {
+        self.field_geom[Self::field_slot(id)].clone()
+    }
+
+    /// 窗口坐标 → 输入框里的字节偏移。
+    ///
+    /// 做法与正文选区一致：用同一套字体字号把**显示串**排一次版，再让排版结果
+    /// 把鼠标位置换算回字节下标。密文框排的是圆点串，所以最后还要按「第几个字」
+    /// 换回原文的偏移 —— 一个点对应一个字，字节数对不上。
+    fn field_index_at(
+        &self,
+        id: FieldId,
+        pos: Point<Pixels>,
+        window: &mut Window,
+    ) -> Option<usize> {
+        let bounds = (*self.geom(id).borrow())?;
+        let tf = self.field(id);
+        let display = if tf.secret {
+            "•".repeat(tf.text().chars().count())
+        } else {
+            tf.text().to_string()
+        };
+        // 与 `text_input` 的 `px_2` 一致：文字从左内边距起画。
+        let pad = sp(8.);
+        let width = (bounds.size.width - pad * 2.).max(px(1.));
+        let prep = crate::select_text::prepare(
+            &display,
+            width,
+            sp(13.),
+            sp(20.),
+            ui_font(),
+            rgb(TEXT).into(),
+            window,
+        );
+        let local = point(pos.x - bounds.origin.x - pad, pos.y - bounds.origin.y - pad);
+        let at = prep.index_at(local);
+        Some(if tf.secret {
+            tf.char_to_byte(at / '•'.len_utf8())
+        } else {
+            at
+        })
+    }
+
+    /// 在输入框上按下左键：光标落到点击处，开始一段可能被拖长的选区。
+    fn start_field_drag(
+        &mut self,
+        id: FieldId,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.field_index_at(id, pos, window) else {
+            return;
+        };
+        self.field_mut(id).start_select(ix);
+        self.field_drag = Some(id);
+        cx.notify();
+    }
+
+    /// 拖到某处：锚点不动，另一头跟过去。
+    fn drag_field_to(
+        &mut self,
+        id: FieldId,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.field_drag != Some(id) || !self.field(id).is_dragging() {
+            return;
+        }
+        let Some(ix) = self.field_index_at(id, pos, window) else {
+            return;
+        };
+        let before = self.field(id).edit.selection;
+        self.field_mut(id).extend_to(ix);
+        if self.field(id).edit.selection != before {
+            cx.notify();
+        }
+    }
+
+    fn end_field_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.field_drag.take() {
+            self.field_mut(id).end_select();
+            cx.notify();
+        }
+    }
+
     fn focus_field(&mut self, id: FieldId, cx: &mut Context<Self>) {
         self.active_field = Some(id);
         self.pending_focus = Some(id);
@@ -1359,10 +1586,26 @@ impl App {
             match ks.key.as_str() {
                 "backspace" => self.field_mut(id).backspace(),
                 "delete" => self.field_mut(id).delete(),
-                "left" => self.field_mut(id).move_left(),
-                "right" => self.field_mut(id).move_right(),
-                "home" => self.field_mut(id).home(),
-                "end" => self.field_mut(id).end(),
+                // 方向键带 Shift 就是「拉选区」：编辑器的通例，手不用离开键盘。
+                "left" | "right" | "home" | "end" => {
+                    let keep = ks.modifiers.shift;
+                    let f = self.field_mut(id);
+                    match ks.key.as_str() {
+                        "left" => {
+                            let ix = f.edit.prev_index();
+                            f.edit.move_caret_to(ix, keep);
+                        }
+                        "right" => {
+                            let ix = f.edit.next_index();
+                            f.edit.move_caret_to(ix, keep);
+                        }
+                        "home" => f.edit.move_caret_to(0, keep),
+                        _ => {
+                            let end = f.text().len();
+                            f.edit.move_caret_to(end, keep);
+                        }
+                    }
+                }
                 // 空格是 GPUI 里的「命名的键」：`key` 是 "space"，`key_char` 是
                 // None（Windows 后端的 `parse_immutable` 先把它认走了，只有模拟
                 // 输入才会补 `key_char`）。所以它走不到下面那条通用分支，不单独
@@ -1415,6 +1658,7 @@ impl App {
         // 会悬在窗口中间。语言本身已经落盘，直接收起即可。
         self.lang_menu = None;
         self.field_ctx = None;
+        self.field_drag = None;
         cx.notify();
     }
 
@@ -1423,6 +1667,7 @@ impl App {
         self.active_field = None;
         self.lang_menu = None;
         self.field_ctx = None;
+        self.field_drag = None;
         self.refocus_root = true;
         cx.notify();
     }
@@ -1635,6 +1880,8 @@ impl App {
     fn select(&mut self, id: &str, cx: &mut Context<Self>) {
         self.selected = Some(id.to_string());
         self.tab = Tab::Overview;
+        self.done_pop = None;
+        self.done_pop_hide_at = None;
         cx.notify();
     }
 
@@ -2679,6 +2926,186 @@ impl App {
             .count()
     }
 
+    /// 这一项已经下完的版本，最近完成的在前。
+    ///
+    /// 数据来自 `history.json`：同一个版本重复下过（断点续传后又点了一次）只留
+    /// 最后一次，否则清单里会出现同一版两行、指向同两个目录。失败的记录不算
+    /// ——「下过但没成」没有目录可打开。
+    fn done_versions(&self, name: &str) -> Vec<DoneVersion> {
+        let done = RecordStatus::Done.stored();
+        let mut out: Vec<DoneVersion> = Vec::new();
+        for r in &self.history {
+            if r.app != name || r.status != done || r.path.is_empty() {
+                continue;
+            }
+            let dir = std::path::Path::new(&r.path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if dir.is_empty() {
+                continue;
+            }
+            match out.iter_mut().find(|d| d.version == r.version) {
+                Some(d) => {
+                    if r.finished_at > d.at {
+                        d.dir = dir;
+                        d.size = r.size;
+                        d.at = r.finished_at;
+                    }
+                }
+                None => out.push(DoneVersion {
+                    version: r.version.clone(),
+                    dir,
+                    size: r.size,
+                    at: r.finished_at,
+                }),
+            }
+        }
+        out.sort_by_key(|d| std::cmp::Reverse(d.at));
+        out
+    }
+
+    /// 悬停浮层「已下载版本」。与 [`Self::dl_pop_layer`] 同一套定位，只是内容
+    /// 换成可以点的行：点一行就用系统文件管理器打开那个版本目录。
+    fn done_pop_layer(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pop) = self.done_pop.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(track) = self.tracks.iter().find(|t| t.id == pop.track) else {
+            return div().into_any_element();
+        };
+        let vers = self.done_versions(&track.name);
+        if vers.is_empty() {
+            return div().into_any_element();
+        }
+        const MAX_ROWS: usize = 8;
+        let shown = vers.len().min(MAX_ROWS);
+        let more = vers.len() - shown;
+        let w = 268. * scale();
+        let h = (40. + shown as f32 * 26. + 20.) * scale();
+        let x = (272. * scale() + 6.).min((vw - w - 8.).max(8.)).max(8.);
+        let y = (pop.y - 12.).min((vh - h - 8.).max(8.)).max(8.);
+
+        // 鼠标能从条目挪进浮层里点：离开条目先给一小段宽限，浮层自己收到
+        // hover(true) 就把宽限取消，离开浮层再重新计时。
+        let ent = cx.entity();
+
+        div()
+            .id("done-pop")
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(w))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .overflow_hidden()
+            .on_hover(move |hovered: &bool, _, app| {
+                let hovered = *hovered;
+                ent.update(app, |this, cx| {
+                    if hovered {
+                        if this.done_pop_hide_at.take().is_some() {
+                            cx.notify();
+                        }
+                    } else if this.done_pop.is_some() {
+                        this.done_pop_hide_at =
+                            Some(Instant::now() + Duration::from_millis(220));
+                        cx.notify();
+                    }
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .child(
+                        div()
+                            .text_size(sp(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .text_ellipsis()
+                            .child(track.name.clone()),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(sp(11.5))
+                            .text_color(rgb(GREEN))
+                            .child(tf!("已下 {} 个版本", "{} versions", vers.len())),
+                    ),
+            )
+            .children(vers.into_iter().take(MAX_ROWS).map(|v| {
+                let dir = v.dir.clone();
+                div()
+                    .id(SharedString::from(format!("done-{}", v.version)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(sp(12.))
+                            .text_color(rgb(TEXT))
+                            .text_ellipsis()
+                            .child(format!("v{}", v.version.trim_start_matches('v'))),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(sp(11.))
+                            .text_color(rgb(FAINT))
+                            .child(util::fmt_bytes(v.size)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(sp(11.))
+                            .text_color(rgb(ACCENT))
+                            .child(t("打开", "Open")),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let _ = open::that_detached(&dir);
+                        this.done_pop = None;
+                        this.done_pop_hide_at = None;
+                        cx.notify();
+                    }))
+            }))
+            .when(more > 0, |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_size(sp(11.))
+                        .text_color(rgb(FAINT))
+                        .child(tf!("还有 {} 个更早的版本", "{} older versions", more)),
+                )
+            })
+            .child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .text_size(sp(11.))
+                    .text_color(rgb(FAINT))
+                    .child(t("点一行打开所在文件夹", "Click a row to open its folder")),
+            )
+            .into_any_element()
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let needle = self.filter.text().trim().to_lowercase();
         let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
@@ -2797,6 +3224,9 @@ impl App {
                                 // 是「这一项」，不是「最后点的那一个」。
                                 let agg = downloading.then(|| aggregate(&live));
                                 let pop_id = t.id.clone();
+                                // 已经下完的版本数：有的话悬停也要浮出一张清单，
+                                // 让「这一项我下过哪几版、在哪儿」不用点进详情去看。
+                                let done_n = self.done_versions(&t.name).len();
                                 div()
                                     .id(SharedString::from(format!("row-{}", t.id)))
                                     .flex()
@@ -2850,23 +3280,40 @@ impl App {
                                                 .child(sub),
                                         )
                                     })
-                                    .when(downloading, |d| {
+                                    .when(downloading || done_n > 0, |d| {
                                         let ent = cx.entity();
+                                        let live_id = pop_id.clone();
+                                        let done_id = pop_id.clone();
                                         d.on_mouse_move(cx.listener(
                                             move |this, ev: &gpui::MouseMoveEvent, _, cx| {
                                                 // 同一条上继续移动不再重设：位置一样却
                                                 // 每像素通知一次，等于整窗每秒重绘几十遍。
-                                                if this
-                                                    .dl_pop
-                                                    .as_ref()
-                                                    .is_some_and(|p| p.track == pop_id)
-                                                {
-                                                    return;
+                                                if downloading {
+                                                    if this.dl_pop.as_ref().is_some_and(|p| {
+                                                        p.track == live_id
+                                                    }) {
+                                                        return;
+                                                    }
+                                                    this.dl_pop = Some(DlPop {
+                                                        track: live_id.clone(),
+                                                        y: ev.position.y.into(),
+                                                    });
+                                                    // 下载中的浮层优先级更高，别让下面那份
+                                                    // 同时挂在半空。
+                                                    this.done_pop = None;
+                                                    this.done_pop_hide_at = None;
+                                                } else {
+                                                    if this.done_pop.as_ref().is_some_and(|p| {
+                                                        p.track == done_id
+                                                    }) {
+                                                        return;
+                                                    }
+                                                    this.done_pop = Some(DonePop {
+                                                        track: done_id.clone(),
+                                                        y: ev.position.y.into(),
+                                                    });
+                                                    this.done_pop_hide_at = None;
                                                 }
-                                                this.dl_pop = Some(DlPop {
-                                                    track: pop_id.clone(),
-                                                    y: ev.position.y.into(),
-                                                });
                                                 cx.notify();
                                             },
                                         ))
@@ -2880,6 +3327,15 @@ impl App {
                                             ent.update(app, |this, cx| {
                                                 if this.dl_pop.is_some() {
                                                     this.dl_pop = None;
+                                                    cx.notify();
+                                                }
+                                                // 已下载那份是**可以点的**，立刻收会让
+                                                // 鼠标永远挪不进去：先给一小段宽限，等
+                                                // 浮层自己收到 hover 再撤。
+                                                if this.done_pop.is_some() {
+                                                    this.done_pop_hide_at =
+                                                        Some(Instant::now()
+                                                            + Duration::from_millis(220));
                                                     cx.notify();
                                                 }
                                             });
@@ -3734,6 +4190,21 @@ impl Render for App {
                     }
                 },
             ))
+            // 拖选的兜底：输入框内部由那颗输入框自己处理，鼠标一旦拖出框外就只剩
+            // 这里能收到 —— 否则选区会卡在边框上，用户往右拖多远都不再变长。
+            .when(self.field_drag.is_some(), |d| {
+                d.on_mouse_move(cx.listener(
+                    |this, ev: &gpui::MouseMoveEvent, window, cx| {
+                        if let Some(id) = this.field_drag {
+                            this.drag_field_to(id, ev.position, window, cx);
+                        }
+                    },
+                ))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.end_field_drag(cx)),
+                )
+            })
             // 快捷键的 action 监听必须挂在元素上：`Window::on_action` 只能在
             // dispatch 树构建期间注册，窗口刚建好时注册会 panic。
             .on_action(cx.listener(|this, _: &AddTrack, _, cx| {
@@ -3875,6 +4346,8 @@ impl Render for App {
             .child(self.queue_panel(vh, cx))
             // 悬停详情浮层：不参与布局，压在正文之上、弹窗之下。
             .child(self.dl_pop_layer(vw, vh))
+            // 已下载版本的清单：同样悬空，但它可以点，所以压在弹窗之下、正文之上。
+            .child(self.done_pop_layer(vw, vh, cx))
             // toast 是**浮层**：`absolute` 不参与 flex 布局，出现和消失都不会
             // 让页面跳一下，也不会把底部队列往上顶。放顶部居中是刻意的——
             // 底部已经被队列占着，右下角还会压住「暂停 / 取消」这些按钮。
@@ -4198,6 +4671,17 @@ impl App {
             None => div().child(body).into_any_element(),
         };
 
+        let geom = self.geom(field);
+        let cell = geom.clone();
+
+        // 外面再包一层只为量到里面那个 div 的矩形：`on_children_prepainted` 给的
+        // 正是子元素的 bounds，比在框里塞 canvas 干净（canvas 会参与布局）。
+        div().on_children_prepainted(move |bounds, _, _| {
+            if let Some(b) = bounds.first() {
+                *cell.borrow_mut() = Some(*b);
+            }
+        })
+        .child(
         div()
             .id(SharedString::from(format!("input-{field:?}")))
             .w_full()
@@ -4216,6 +4700,26 @@ impl App {
             .track_focus(&focus)
             .child(content)
             .on_click(cx.listener(move |this, _, _, cx| this.focus_field(field, cx)))
+            // 左键按下即定位光标，并从这里开始一段拖选。选区是手画的：GPUI 0.2.2
+            // 的文本元素不认拖选，但排版结果能把 x 换回字节偏移（见 field_index_at）。
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                    this.focus_field(field, cx);
+                    this.start_field_drag(field, ev.position, window, cx);
+                }),
+            )
+            // 拖到框外也要接着选：根节点上还有一份同样的处理（见 render），
+            // 这里管框内，那边管框外。
+            .on_mouse_move(cx.listener(
+                move |this, ev: &gpui::MouseMoveEvent, window, cx| {
+                    this.drag_field_to(field, ev.position, window, cx);
+                },
+            ))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.end_field_drag(cx)),
+            )
             // 右键菜单：剪切 / 复制 / 粘贴 / 全选。事件停在这里，否则会冒泡给
             // 弹窗底下那层，被当成「点别处」处理掉。
             .on_mouse_down(
@@ -4228,7 +4732,8 @@ impl App {
             )
             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
                 this.on_field_key(field, ev, cx)
-            }))
+            })),
+        )
     }
 
     // -- 弹窗 --------------------------------------------------------------
@@ -5076,6 +5581,45 @@ mod tests {
         assert_eq!(e.text, "");
         assert_eq!(e.cursor, 0);
         assert!(!e.cut_selection(), "再切一次已经没有选区可切");
+    }
+
+    #[test]
+    fn drag_selects_a_range_and_backspace_only_removes_that() {
+        let mut e = EditState::new("hello world");
+        e.start_select(6);
+        e.extend_to(11);
+        let (text, n) = e.selected().expect("拖出一段就有选区");
+        assert_eq!((text.as_str(), n), ("world", 5));
+        // 退格只删选区：早先这条会是整段清空（那时选区只可能来自 Ctrl+A）。
+        e.backspace();
+        assert_eq!(e.text, "hello ");
+        assert_eq!(e.cursor, 6);
+    }
+
+    #[test]
+    fn dragging_backwards_keeps_the_range_ordered() {
+        let mut e = EditState::new("abcdef");
+        e.start_select(4);
+        e.extend_to(1);
+        assert_eq!(e.selected().unwrap().0, "bcd");
+        e.insert("X", false);
+        assert_eq!(e.text, "aXef");
+    }
+
+    #[test]
+    fn shift_arrows_extend_and_shrink_from_the_anchor() {
+        let mut e = EditState::new("abc");
+        e.home();
+        e.move_caret_to(e.next_index(), true);
+        assert_eq!(e.selected().unwrap().0, "a");
+        e.move_caret_to(e.next_index(), true);
+        assert_eq!(e.selected().unwrap().0, "ab");
+        // 往回走是收窄，锚点不动
+        e.move_caret_to(e.prev_index(), true);
+        assert_eq!(e.selected().unwrap().0, "a");
+        // 不带 Shift 就把选区丢掉
+        e.move_caret_to(e.next_index(), false);
+        assert!(e.selected().is_none());
     }
 
     #[test]

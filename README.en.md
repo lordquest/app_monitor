@@ -260,7 +260,8 @@ AM_GPUI_FAKE_DL=1 app-monitor     # inject a fake "downloading" task: no request
 GPUI 0.2 ships no text widget, so the inputs in **add track / settings / filter** are written from scratch:
 
 - printable characters (space included), backspace, Delete, left/right / Home / End, **Ctrl+V paste**, Ctrl+C copy, Ctrl+X cut, and Ctrl+A followed by typing replaces the selection;
-- **right-click menu**: Cut / Copy / Paste / Select all. The first two are greyed out with no selection, same as a native text box; after Select all the text gets a light blue highlight (dot-masked fields such as the token are not highlighted, but Copy still yields the real text);
+- **drag to select**: pressing the left button places the caret, and the selection follows the pointer as far as you drag — even out of the box and across the window (the root node keeps extending it). Shift + arrows / Home / End work too; backspace then removes only the selected range;
+- **right-click menu**: Cut / Copy / Paste / Select all. The first two are greyed out with no selection, same as a native text box; the selected range gets a light blue highlight (dot-masked fields such as the token are not highlighted, but Copy still yields the real text);
 - **no IME support**: these three fields hold URLs, directories, tokens and proxy addresses — all ASCII. Pasting is unaffected by keyboard layout, and track names are derived from URLs, so no one needs to type CJK here;
 - the editing logic lives in `EditState` (plain strings, no window), so the error-prone parts — UTF-8 boundaries, CRLF normalisation — are covered by unit tests.
 
@@ -320,6 +321,7 @@ The bottom queue started out permanent and auto-expanded whenever a task existed
 
 * **In progress, draw a 3px bar in the left list only**, replacing the version/status line. The list only has to answer "is this one moving"; bytes so far, speed and state are details. When one entry downloads several files at once (Windows + Linux builds), the bar shows the **byte-weighted aggregate**, not the task clicked last — otherwise the bar jumps back and forth as tasks take turns and looks like it is going backwards.
 * **Details on hover**: hovering the row floats up each file's `downloaded / total · percent`, speed and state (with more than one file the card header says "N files" and lists them one by one). The card is absolutely positioned on the root node, not drawn inside the row — the sidebar is a scroll container and would clip anything wider than it. It hugs the sidebar's right edge horizontally and follows the hovered row vertically; the anchor is sampled once on entry, so moving within the row does not recompute (otherwise every pixel of movement repaints the whole window).
+* **hover again once something is downloaded**: when nothing is running but the item has finished downloads in its history, hovering floats up the list of versions (version + size, newest first, at most 8 rows). Clicking a row opens that version's folder in the system file manager. The data comes from `history.json`, and a version downloaded repeatedly is listed once. This card is **clickable**, so it is not dismissed the moment the pointer leaves the row: there is a 220 ms grace period, cancelled as soon as the pointer enters the card.
 * **The whole queue folds into one top-bar button** (`Downloads N`) that opens on click and closes on the next. The panel is capped at 30% of the window height and scrolls internally beyond that. Clearing finished tasks also collapses it, so the next download does not pop it back open.
 
 Closing the popover relies entirely on `on_hover`'s end event: `on_mouse_move` only fires while the pointer is still over the element and never again after it leaves, so relying on it alone leaves the card stuck on screen.
@@ -372,7 +374,7 @@ Windows caches exe icons: if Explorer still shows the old icon after an update, 
 - pc528's download area needs a login / reply, which the card notes; use **Open source page**.
 - Netdisks (Quark / Baidu / Lanzou / 123) only open in the browser and never join automatic downloads.
 - The hand-rolled inputs have no CJK input method; those fields are not meant for Chinese text — paste if you need a Chinese title.
-- **Only the overview and release-notes bodies are selectable**: GPUI 0.2.2 has no text selection, and these two are custom-drawn selectable text. Version numbers and file names still rely on buttons (asset **Copy**, version card **Copy version / Copy link**, **Copy all**).
+- **Text you can drag-select**: the overview and release-notes bodies, plus the inputs in add track / settings / filter. Version numbers and file names still rely on buttons (asset **Copy**, version card **Copy version / Copy link**, **Copy all**).
 - **The English UI translates interface text only**: track names, group names and release bodies come from upstream and stay as-is (many repos only write Chinese release notes).
 - The UI requires Windows 10 or newer; Win7/8 is stuck on v0.1.2.
 - Software-site parsing depends on the site's search HTML; a redesign can break the match — `--check --verbose` pinpoints it quickly.
