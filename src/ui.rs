@@ -162,6 +162,12 @@ struct DlPop {
 struct DonePop {
     track: String,
     y: f32,
+    /// 进入这一行时算好的清单，只留目录还在的版本。
+    ///
+    /// 不在渲染时重算，是因为要 `stat` 磁盘：而侧栏每帧都会问「这一项有没有
+    /// 下过东西」，逐帧 stat 不划算。悬停的那一刻查一次就够 —— 用户删了文件
+    /// 再悬停，看到的自然是新的。
+    vers: Vec<DoneVersion>,
 }
 
 /// 一个已经下完的版本，浮层里一行。
@@ -170,6 +176,17 @@ struct DoneVersion {
     dir: String,
     size: u64,
     at: i64,
+}
+
+/// 只留目录还在的版本。
+///
+/// `history.json` 记的是「下过」，不是「现在还在」：手工删掉旧版本目录之后记录
+/// 不会跟着消失，照着列会给出几条点了打不开的空行。悬停清单的每一行都是用来
+/// 打开目录的，所以口径是「能打开的才算」。
+fn keep_on_disk(vers: Vec<DoneVersion>) -> Vec<DoneVersion> {
+    vers.into_iter()
+        .filter(|d| std::path::Path::new(&d.dir).is_dir())
+        .collect()
 }
 
 /// 这条子任务是不是还「没结束」（排队、进行中、暂停都算）。
@@ -3030,6 +3047,15 @@ impl App {
         out
     }
 
+    /// 同 [`Self::done_versions`]，但只留目录还在的。
+    ///
+    /// `history.json` 记的是「下过」，不是「现在还在」：手工删掉旧版本目录之后，
+    /// 记录不会跟着消失，直接照着列会给出几条点了就报错的空行。这里的口径是
+    /// 「能打开的才算」—— 悬停清单的每一行本来就是用来打开目录的。
+    fn done_versions_on_disk(&self, name: &str) -> Vec<DoneVersion> {
+        keep_on_disk(self.done_versions(name))
+    }
+
     /// 悬停浮层「已下载版本」。与 [`Self::dl_pop_layer`] 同一套定位，只是内容
     /// 换成可以点的行：点一行就用系统文件管理器打开那个版本目录。
     fn done_pop_layer(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> AnyElement {
@@ -3039,7 +3065,7 @@ impl App {
         let Some(track) = self.tracks.iter().find(|t| t.id == pop.track) else {
             return div().into_any_element();
         };
-        let vers = self.done_versions(&track.name);
+        let vers = &pop.vers;
         if vers.is_empty() {
             return div().into_any_element();
         }
@@ -3108,7 +3134,7 @@ impl App {
                             .child(tf!("已下 {} 个版本", "{} versions", vers.len())),
                     ),
             )
-            .children(vers.into_iter().take(MAX_ROWS).map(|v| {
+            .children(vers.iter().take(MAX_ROWS).map(|v| {
                 let dir = v.dir.clone();
                 div()
                     .id(SharedString::from(format!("done-{}", v.version)))
@@ -3349,6 +3375,7 @@ impl App {
                                         let ent = cx.entity();
                                         let live_id = pop_id.clone();
                                         let done_id = pop_id.clone();
+                                        let done_name = t.name.clone();
                                         d.on_mouse_move(cx.listener(
                                             move |this, ev: &gpui::MouseMoveEvent, _, cx| {
                                                 // 同一条上继续移动不再重设：位置一样却
@@ -3373,11 +3400,20 @@ impl App {
                                                     }) {
                                                         return;
                                                     }
-                                                    this.done_pop = Some(DonePop {
-                                                        track: done_id.clone(),
-                                                        y: ev.position.y.into(),
-                                                    });
-                                                    this.done_pop_hide_at = None;
+                                                    // 目录被手工删掉的版本不算；一条都不剩
+                                                    // 就别浮一张空卡，那等于什么都没发生。
+                                                    let vers = this.done_versions_on_disk(&done_name);
+                                                    if vers.is_empty() {
+                                                        this.done_pop = None;
+                                                        this.done_pop_hide_at = None;
+                                                    } else {
+                                                        this.done_pop = Some(DonePop {
+                                                            track: done_id.clone(),
+                                                            y: ev.position.y.into(),
+                                                            vers,
+                                                        });
+                                                        this.done_pop_hide_at = None;
+                                                    }
                                                 }
                                                 cx.notify();
                                             },
@@ -5616,7 +5652,31 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditState, Selection, picked};
+    use super::{DoneVersion, EditState, Selection, keep_on_disk, picked};
+
+    /// 悬停清单的口径：目录被手工删掉的版本不该再列出来。
+    ///
+    /// 用真目录而不是 mock：这里要的正是「`is_dir` 说了算」这件事。
+    #[test]
+    fn done_list_drops_versions_whose_folder_is_gone() {
+        let root = std::env::temp_dir().join("am_done_on_disk_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let alive = root.join("1.0");
+        std::fs::create_dir_all(&alive).unwrap();
+        let gone = root.join("0.9");
+        let mk = |version: &str, dir: &std::path::Path| DoneVersion {
+            version: version.to_string(),
+            dir: dir.to_string_lossy().to_string(),
+            size: 1,
+            at: 0,
+        };
+
+        let kept = keep_on_disk(vec![mk("1.0", &alive), mk("0.9", &gone)]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].version, "1.0");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn typing_appends_at_cursor() {
