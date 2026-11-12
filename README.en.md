@@ -45,11 +45,11 @@ Grab a build from [Releases](https://github.com/lordquest/app_monitor/releases) 
 
 | Platform | File |
 | --- | --- |
-| Windows x64 | `app-monitor-v0.2.4-windows-x64.zip` (`app-monitor.exe`, Windows 10 or newer) |
-| Linux x64 | `app-monitor-v0.2.4-linux-x64.tar.gz` (needs X11/Wayland + a Vulkan driver) |
-| macOS arm64 (Apple Silicon) | `app-monitor-v0.2.4-macos-arm64.tar.gz` (unsigned; if Gatekeeper blocks it, run `xattr -d com.apple.quarantine ./app-monitor`) |
+| Windows x64 | `app-monitor-v0.2.5-windows-x64.zip` (`app-monitor.exe`, Windows 10 or newer) |
+| Linux x64 | `app-monitor-v0.2.5-linux-x64.tar.gz` (needs X11/Wayland + a Vulkan driver) |
+| macOS arm64 (Apple Silicon) | `app-monitor-v0.2.5-macos-arm64.tar.gz` (unsigned; if Gatekeeper blocks it, run `xattr -d com.apple.quarantine ./app-monitor`) |
 
-The Windows binary is smoke-tested on Windows; the Linux / macOS binaries come from the same source built by GitHub Actions. The version lives in the tag — this repo is currently at `0.2.4`.
+The Windows binary is smoke-tested on Windows; the Linux / macOS binaries come from the same source built by GitHub Actions. The version lives in the tag — this repo is currently at `0.2.5`.
 
 ## Features
 
@@ -90,8 +90,8 @@ The Windows build statically links the MSVC runtime (`/MT`) via `-C target-featu
 `.github/workflows/release.yml` runs `cargo build --release` on three runners in parallel (Windows x64 / Linux x64 / macOS arm64) and uploads the packaged results:
 
 ```bash
-git tag -a v0.2.4 -m "app-monitor v0.2.4"   # tagging triggers the build + Release
-git push origin v0.2.4
+git tag -a v0.2.5 -m "app-monitor v0.2.5"   # tagging triggers the build + Release
+git push origin v0.2.5
 ```
 
 - Push a `v*` tag → when the build finishes a Release is created with the three platform archives attached (including `README.md` / `LICENSE`).
