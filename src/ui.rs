@@ -740,6 +740,25 @@ enum FieldAct {
     All,
 }
 
+/// 侧栏某一条追踪项上右键弹出的菜单。
+///
+/// 与 [`CtxMenu`] / [`FieldCtx`] 再分一个类型，理由是作用对象又换了一层：那两个
+/// 管的是文字，这个管的是**一整条追踪项**（重新检查、复制地址、从列表移除）。
+/// 坐标口径相同：窗口坐标下的逻辑像素。
+struct RowCtx {
+    track: String,
+    x: f32,
+    y: f32,
+}
+
+/// 追踪项右键菜单里的动作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowAct {
+    Refresh,
+    CopyUrl,
+    Delete,
+}
+
 /// 语言下拉菜单是被哪一颗按钮拉起的：顶栏一颗、设置弹窗里一颗。
 ///
 /// 菜单只记「哪一个」，坐标每帧从对应的 cell 现读 —— 窗口缩放或设置内容滚动
@@ -861,6 +880,8 @@ pub struct App {
     ctx: Option<CtxMenu>,
     /// 输入框上右键弹出的菜单（剪切 / 复制 / 粘贴 / 全选）。`None` 表示收起。
     field_ctx: Option<FieldCtx>,
+    /// 侧栏某一条追踪项上右键弹出的菜单。`None` 表示收起。
+    row_ctx: Option<RowCtx>,
     /// 每个输入框绘制时的外框（窗口坐标）。鼠标落下时靠它把位置换算成字节偏移 ——
     /// GPUI 的事件回调里拿不到元素自己的 bounds，只能在绘制阶段回填一次。
     field_geom: [Rc<RefCell<Option<Bounds<Pixels>>>>; 5],
@@ -965,6 +986,7 @@ impl App {
             sel_geom: Rc::new(RefCell::new(None)),
             ctx: None,
             field_ctx: None,
+            row_ctx: None,
             field_geom: std::array::from_fn(|_| Rc::new(RefCell::new(None))),
             field_drag: None,
             done_pop: None,
@@ -1739,6 +1761,7 @@ impl App {
         // 会悬在窗口中间。语言本身已经落盘，直接收起即可。
         self.lang_menu = None;
         self.field_ctx = None;
+        self.row_ctx = None;
         self.field_drag = None;
         cx.notify();
     }
@@ -1748,6 +1771,7 @@ impl App {
         self.active_field = None;
         self.lang_menu = None;
         self.field_ctx = None;
+        self.row_ctx = None;
         self.field_drag = None;
         self.refocus_root = true;
         cx.notify();
@@ -1887,9 +1911,11 @@ impl App {
         }
         crate::store::write_tracks(&self.tracks);
         self.toast(
+            // 说清楚删的是什么：`history.json` 与磁盘上的文件都没动，下次再添加
+            // 同一项时旧记录还在。
             tf!(
-                "已删除「{}」",
-                "Deleted \"{}\" and its local record",
+                "已移除「{}」，本地文件没动",
+                "Removed \"{}\" — local files untouched",
                 name
             ),
             cx,
@@ -1963,6 +1989,7 @@ impl App {
         self.tab = Tab::Overview;
         self.done_pop = None;
         self.done_pop_hide_at = None;
+        self.row_ctx = None;
         cx.notify();
     }
 
@@ -2125,6 +2152,50 @@ impl App {
     fn close_field_ctx(&mut self, cx: &mut Context<Self>) {
         if self.field_ctx.take().is_some() {
             cx.notify();
+        }
+    }
+
+    // -- 侧栏追踪项的右键菜单 ----------------------------------------------
+
+    /// 在某一条追踪项上按下右键。位置用**窗口坐标**，与 `field_ctx` 同一口径，
+    /// 根节点绝对定位时不必再减一遍 bounds。
+    fn open_row_ctx(
+        &mut self,
+        id: &str,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.row_ctx = Some(RowCtx {
+            track: id.to_string(),
+            x,
+            y,
+        });
+        // 悬停浮层和右键菜单是两种「此刻的意图」，同时挂两份会互相盖住。
+        self.done_pop = None;
+        self.done_pop_hide_at = None;
+        self.dl_pop = None;
+        cx.notify();
+    }
+
+    fn close_row_ctx(&mut self, cx: &mut Context<Self>) {
+        if self.row_ctx.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 右键菜单里某一项的落地动作。
+    fn row_act(&mut self, id: &str, url: &str, act: RowAct, cx: &mut Context<Self>) {
+        self.row_ctx = None;
+        match act {
+            RowAct::Refresh => self.resolve_one(id, cx),
+            RowAct::CopyUrl => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.to_string()));
+                self.toast(t("已复制地址", "URL copied"), cx);
+            }
+            // 移除的是追踪项本身，磁盘上的文件不动 —— 文案里要说清楚，
+            // 否则「删除」二字很容易被理解成连下载好的东西一起删。
+            RowAct::Delete => self.delete_track(id, cx),
         }
     }
 
@@ -2433,6 +2504,106 @@ impl App {
                                         }),
                                     )
                             })
+                            .child(label)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// 侧栏追踪项上右键弹出的菜单。
+    ///
+    /// 三项里只有「删除」是破坏性的，所以它用红字单独压在最后一行 —— 与详情页
+    /// 那颗「删除」同一套颜色，不至于在菜单里误点。
+    fn row_ctx_layer(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu) = self.row_ctx.as_ref() else {
+            return div().into_any_element();
+        };
+        // 这一条可能已经不在列表里了（刚删掉、或撤销了）：那就当菜单已散场。
+        let Some(track) = self.tracks.iter().find(|t| t.id == menu.track) else {
+            return div().into_any_element();
+        };
+        let id = track.id.clone();
+        let url = track.url.clone();
+        let items: [(RowAct, &'static str, u32); 3] = [
+            (RowAct::Refresh, t("重新检查", "Refresh"), TEXT),
+            (RowAct::CopyUrl, t("复制地址", "Copy URL"), TEXT),
+            // 括号里那句是给「删除」兜底的：它删的是追踪项，不是磁盘上的文件。
+            (
+                RowAct::Delete,
+                t("从列表删除（不动文件）", "Remove (files untouched)"),
+                RED,
+            ),
+        ];
+        let w = 196. * scale();
+        let h = (items.len() as f32 * 34. + 12.) * scale();
+        let x = menu.x.min((vw - w - 8.).max(8.)).max(8.);
+        // 靠近底边时向上翻：菜单被窗口咬掉一截就没法点了。
+        let y = if menu.y + h + 8. > vh {
+            (menu.y - h).max(8.)
+        } else {
+            menu.y
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                // 透明遮罩：点任何别的地方都算「取消」。没有它，菜单会一直挂着，
+                // 直到用户恰好又右键了一次。
+                div()
+                    .id("row-ctx-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_row_ctx(cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_row_ctx(cx);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("row-ctx-menu")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .py(px(6. * scale()))
+                    .rounded_md()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .children(items.into_iter().enumerate().map(|(i, (act, label, color))| {
+                        let id2 = id.clone();
+                        let url2 = url.clone();
+                        div()
+                            .id(SharedString::from(format!("row-ctx-item-{i}")))
+                            .px_3()
+                            .py(px(7. * scale()))
+                            .text_size(sp(13.))
+                            .text_color(rgb(color))
+                            .whitespace_nowrap()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.row_act(&id2, &url2, act, cx);
+                                }),
+                            )
                             .child(label)
                     })),
             )
@@ -3315,6 +3486,7 @@ impl App {
                                 // 是「这一项」，不是「最后点的那一个」。
                                 let agg = downloading.then(|| aggregate(&live));
                                 let pop_id = t.id.clone();
+                                let row_id = t.id.clone();
                                 // 已经下完的版本数：有的话悬停也要浮出一张清单，
                                 // 让「这一项我下过哪几版、在哪儿」不用点进详情去看。
                                 let done_n = self.done_versions(&t.name).len();
@@ -3442,6 +3614,23 @@ impl App {
                                             });
                                         })
                                     })
+                                    // 右键：条目能做的管理动作都收在这里。删除原先只有
+                                    // 详情页那颗按钮一个入口，想清掉一条得先点开、再
+                                    // 找到「删除」、再确认一次。
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Right,
+                                        cx.listener(
+                                            move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.open_row_ctx(
+                                                    &row_id,
+                                                    ev.position.x.into(),
+                                                    ev.position.y.into(),
+                                                    cx,
+                                                );
+                                            },
+                                        ),
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.select(&t_id, cx)
                                     }))
@@ -4479,6 +4668,8 @@ impl Render for App {
             // 输入框的右键菜单：它由弹窗里的某颗输入框拉起，必须压在弹窗之上，
             // 否则菜单会被半透明的遮罩压暗、还挡不住下面那颗按钮。
             .child(self.field_ctx_layer(vw, vh, cx))
+            // 追踪项的右键菜单：只由主界面拉起，但同样压在所有浮层之上。
+            .child(self.row_ctx_layer(vw, vh, cx))
             // 菜单压在所有东西之上：它是「此刻唯一可点的东西」，被弹窗或 toast
             // 挡住的话用户会以为右键没生效。
             .child(self.ctx_layer(vw, vh, cx))
