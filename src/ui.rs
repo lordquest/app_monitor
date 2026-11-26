@@ -850,6 +850,9 @@ pub struct App {
     add_skipped: Vec<String>,
     /// 删除确认：为 Some 时该条目显示「确认删除」。
     confirm_delete: Option<String>,
+    /// 「浏览…」的目录选择框跑在独立线程里，结果从这条通道回传。
+    /// `Some` 表示有一个对话框正开着，同时用来挡住连点。
+    dir_pick_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
 
     /// 自动检查的计时起点。
     last_auto: Instant,
@@ -980,6 +983,7 @@ impl App {
             root_focus: cx.focus_handle(),
             add_skipped: Vec::new(),
             confirm_delete: None,
+            dir_pick_rx: None,
             last_auto: Instant::now(),
             title_lang: None,
             sel: None,
@@ -1161,6 +1165,24 @@ impl App {
 
     fn drain(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        // 「浏览…」的对话框在独立线程里跑（见 pick_dir），结果从这里收。
+        // 这里跑在正常的事件循环里、没有持有借用，所以不会撞上重入 panic。
+        let picked: Option<Option<String>> = match self.dir_pick_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(v) => Some(v),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                // 线程挂了也要解锁按钮，否则「浏览…」永久失效。
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+            },
+            None => None,
+        };
+        if let Some(dir) = picked {
+            self.dir_pick_rx = None;
+            if let Some(dir) = dir {
+                self.set_dir.set(dir);
+            }
+            changed = true;
+        }
         while let Ok(msg) = self.engine.rx.try_recv() {
             match msg {
                 UiMsg::Resolved(id, release) => {
@@ -1895,6 +1917,36 @@ impl App {
         self.field_ctx = None;
         self.refocus_root = true;
         self.toast(t("设置已保存", "Settings saved"), cx);
+    }
+
+    /// 「浏览…」：系统目录选择框是**阻塞**的，不能在点击回调里直接弹。
+    ///
+    /// 回调执行时 GPUI 正持有 `App` 的可变借用（回调拿到的就是 `&mut App`），
+    /// 而 rfd 的 Windows 实现会在这段时间里跑自己的窗口消息循环；循环一转，
+    /// 150ms 的泵就可能醒来去 `update_entity`，撞上「RefCell already borrowed」
+    /// 直接 panic（panic hook 再弹一个「意外退出」框，看起来就是闪退）。
+    /// macOS 上 rfd 用 `run_on_main` 同步等主线程，同样会卡在借用里。
+    ///
+    /// 所以把对话框放到独立线程，结果经通道回传、由 `drain` 落回输入框。
+    /// `dir_pick_rx` 为 `Some` 期间再点按钮会被忽略，免得叠出两个系统对话框。
+    fn pick_dir(&mut self, cx: &mut Context<Self>) {
+        if self.dir_pick_rx.is_some() {
+            return;
+        }
+        let title = t("选择下载根目录", "Choose the download folder").to_string();
+        let start = self.set_dir.text().trim().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new().set_title(title);
+            // 从当前值开始浏览；路径不存在就退回系统默认位置。
+            if !start.is_empty() && std::path::Path::new(&start).is_dir() {
+                dlg = dlg.set_directory(start);
+            }
+            // 取消也要回一条 None，否则通道一直挂着，按钮会再也不响应。
+            let _ = tx.send(dlg.pick_folder().map(|p| p.to_string_lossy().to_string()));
+        });
+        self.dir_pick_rx = Some(rx);
+        cx.notify();
     }
 
     fn delete_track(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -5257,17 +5309,9 @@ impl App {
                 t("下载根目录", "Download folder"),
                 cx,
             )))
-            .child(btn("btn-pick-dir", t("浏览…", "Browse…"), 0xF2F4F8, TEXT).on_click(cx.listener(
-                |this, _, _, cx| {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title(t("选择下载根目录", "Choose the download folder"))
-                        .pick_folder()
-                    {
-                        this.set_dir.set(dir.to_string_lossy().to_string());
-                        cx.notify();
-                    }
-                },
-            )));
+            .child(btn("btn-pick-dir", t("浏览…", "Browse…"), 0xF2F4F8, TEXT).on_click(
+                cx.listener(|this, _, _, cx| this.pick_dir(cx)),
+            ));
 
         let body = div()
             .flex()
